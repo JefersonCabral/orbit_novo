@@ -1,0 +1,1542 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+<!-- ============================================================= -->
+<!-- UTM / Atribuição de Tráfego (propaga UTMs + fbclid p/ Kiwify) -->
+<!-- O mais alto possível, antes de qualquer outro script.         -->
+<!-- ============================================================= -->
+<script>
+(function () {
+  // ─────────────────────────────────────────────
+  // CONFIGURAÇÕES
+  // ─────────────────────────────────────────────
+  var STORAGE_KEY       = '_traffic_attribution';
+  var FIRST_TOUCH_KEY   = '_traffic_attribution_ft';
+  var COOKIE_TTL_DAYS   = 30; // dias de persistência
+  var COOKIE_TTL_MIN    = COOKIE_TTL_DAYS * 24 * 60;
+
+  // Parâmetros capturados (UTMs + click ID do Meta Ads)
+  var TRACKED_PARAMS = [
+    'utm_source',
+    'utm_medium',
+    'utm_campaign',
+    'utm_content',
+    'utm_term',
+    'fbclid',   // Meta Ads (Facebook/Instagram)
+  ];
+
+  // Domínios de checkout onde os UTMs devem ser propagados
+  var CHECKOUT_PATTERNS = [
+    'kiwify.com.br',
+    'pay.kiwify.com.br',
+    'checkout.kiwify.com.br',
+    // Adicione outros domínios de checkout aqui se necessário
+  ];
+
+  // ─────────────────────────────────────────────
+  // UTILIDADES DE COOKIE
+  // ─────────────────────────────────────────────
+  function setCookie(name, value, minutesTTL) {
+    var expires = new Date(Date.now() + minutesTTL * 60 * 1000).toUTCString();
+    // Compartilha o cookie entre subdomínios (ex.: app.orbitsender.com) usando
+    // o domínio registrável. No domínio apex (ex.: orbitsender.com) NÃO definimos
+    // 'domain' — setar em sufixo público (.com) faz o navegador rejeitar o cookie.
+    var host = location.hostname;
+    var labels = host.split('.');
+    var domainPart = '';
+    if (labels.length > 2) {
+      // Há subdomínio: usa os 2 últimos rótulos como domínio registrável.
+      domainPart = '; domain=.' + labels.slice(-2).join('.');
+    }
+    document.cookie =
+      name + '=' + encodeURIComponent(JSON.stringify(value)) +
+      '; expires=' + expires +
+      '; path=/' +
+      domainPart +
+      '; SameSite=Lax';
+  }
+
+  function getCookie(name) {
+    var match = document.cookie.match(
+      new RegExp('(?:^|;\\s*)' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '=([^;]*)')
+    );
+    if (!match) return null;
+    try { return JSON.parse(decodeURIComponent(match[1])); } catch (e) { return null; }
+  }
+
+  // ─────────────────────────────────────────────
+  // UTILIDADES DE LOCALSTORAGE
+  // ─────────────────────────────────────────────
+  function lsGet(key) {
+    try {
+      var raw = localStorage.getItem(key);
+      if (!raw) return null;
+      var parsed = JSON.parse(raw);
+      // Verifica expiração
+      if (parsed._expires && Date.now() > parsed._expires) {
+        localStorage.removeItem(key);
+        return null;
+      }
+      return parsed.data || null;
+    } catch (e) { return null; }
+  }
+
+  function lsSet(key, value, minutesTTL) {
+    try {
+      localStorage.setItem(key, JSON.stringify({
+        data: value,
+        _expires: Date.now() + minutesTTL * 60 * 1000
+      }));
+    } catch (e) {}
+  }
+
+  // ─────────────────────────────────────────────
+  // LER / SALVAR ATRIBUIÇÃO
+  // ─────────────────────────────────────────────
+  function readFromUrl() {
+    var params = new URLSearchParams(window.location.search);
+    var found  = {};
+    TRACKED_PARAMS.forEach(function (key) {
+      var val = params.get(key);
+      if (val) found[key] = val;
+    });
+    return found;
+  }
+
+  function saveAttribution(key, data) {
+    lsSet(key, data, COOKIE_TTL_MIN);
+    setCookie(key, data, COOKIE_TTL_MIN);
+  }
+
+  function readAttribution(key) {
+    return lsGet(key) || getCookie(key) || {};
+  }
+
+  // ─────────────────────────────────────────────
+  // LÓGICA PRINCIPAL DE ATRIBUIÇÃO
+  // ─────────────────────────────────────────────
+  var fromUrl      = readFromUrl();
+  var lastTouch    = readAttribution(STORAGE_KEY);
+  var firstTouch   = readAttribution(FIRST_TOUCH_KEY);
+
+  // Mescla last-touch (último clique prevalece sobre dado salvo)
+  var currentUtms = Object.assign({}, lastTouch, fromUrl);
+
+  if (Object.keys(currentUtms).length > 0) {
+    // Salva last-touch sempre (atualiza a cada visita com UTM)
+    saveAttribution(STORAGE_KEY, currentUtms);
+
+    // Salva first-touch apenas uma vez (nunca sobrescreve)
+    if (!Object.keys(firstTouch).length) {
+      saveAttribution(FIRST_TOUCH_KEY, currentUtms);
+    }
+
+    // Mantém no sessionStorage para acesso rápido na mesma sessão
+    try { sessionStorage.setItem(STORAGE_KEY, JSON.stringify(currentUtms)); } catch (e) {}
+  }
+
+  // ─────────────────────────────────────────────
+  // EXPÕE GLOBALMENTE (para uso em outros scripts, ex: envio de form)
+  // ─────────────────────────────────────────────
+  window._utmTracker = {
+    getLastTouch:  function () { return Object.assign({}, readAttribution(STORAGE_KEY)); },
+    getFirstTouch: function () { return Object.assign({}, readAttribution(FIRST_TOUCH_KEY)); },
+    getAll: function () {
+      return {
+        lastTouch:  window._utmTracker.getLastTouch(),
+        firstTouch: window._utmTracker.getFirstTouch()
+      };
+    }
+  };
+
+  // ─────────────────────────────────────────────
+  // PROPAGAÇÃO: verifica se URL é de checkout
+  // ─────────────────────────────────────────────
+  function isCheckoutUrl(href) {
+    if (!href) return false;
+    return CHECKOUT_PATTERNS.some(function (pattern) {
+      return href.indexOf(pattern) !== -1;
+    });
+  }
+
+  function injectUtmsIntoUrl(href, utms) {
+    if (!Object.keys(utms).length) return href;
+    try {
+      var url = new URL(href, window.location.origin);
+      Object.keys(utms).forEach(function (key) {
+        // Não sobrescreve UTMs que já vieram na URL do checkout
+        if (!url.searchParams.has(key)) {
+          url.searchParams.set(key, utms[key]);
+        }
+      });
+      return url.toString();
+    } catch (e) { return href; }
+  }
+
+  // ─────────────────────────────────────────────
+  // PROPAGAÇÃO EM LINKS <a>
+  // ─────────────────────────────────────────────
+  function appendUtmsToLinks() {
+    var utms = readAttribution(STORAGE_KEY);
+    if (!Object.keys(utms).length) return;
+
+    document.querySelectorAll('a[href]').forEach(function (link) {
+      if (isCheckoutUrl(link.href)) {
+        link.href = injectUtmsIntoUrl(link.href, utms);
+      }
+    });
+  }
+
+  // ─────────────────────────────────────────────
+  // PROPAGAÇÃO EM FORMS (action para checkout)
+  // ─────────────────────────────────────────────
+  function appendUtmsToForms() {
+    var utms = readAttribution(STORAGE_KEY);
+    if (!Object.keys(utms).length) return;
+
+    document.querySelectorAll('form[action]').forEach(function (form) {
+      if (!isCheckoutUrl(form.action)) return;
+
+      Object.keys(utms).forEach(function (key) {
+        // Evita duplicar campos ocultos
+        if (form.querySelector('input[name="' + key + '"]')) return;
+        var input = document.createElement('input');
+        input.type  = 'hidden';
+        input.name  = key;
+        input.value = utms[key];
+        form.appendChild(input);
+      });
+    });
+  }
+
+  // ─────────────────────────────────────────────
+  // INTERCEPTAÇÃO DE CLIQUES (fallback em caso de links dinâmicos)
+  // ─────────────────────────────────────────────
+  function handleClick(e) {
+    var utms = readAttribution(STORAGE_KEY);
+    if (!Object.keys(utms).length) return;
+
+    // Sobe na árvore DOM até encontrar um <a>
+    var el = e.target;
+    while (el && el.tagName !== 'A') { el = el.parentElement; }
+    if (!el || !el.href) return;
+
+    if (isCheckoutUrl(el.href)) {
+      var newHref = injectUtmsIntoUrl(el.href, utms);
+      if (newHref !== el.href) {
+        el.href = newHref;
+      }
+    }
+  }
+
+  // ─────────────────────────────────────────────
+  // OBSERVER: monitora novos elementos adicionados ao DOM
+  // ─────────────────────────────────────────────
+  function startObserver() {
+    if (!window.MutationObserver || !document.body) return;
+
+    var observer = new MutationObserver(function (mutations) {
+      var shouldProcess = mutations.some(function (m) { return m.addedNodes.length > 0; });
+      if (shouldProcess) {
+        appendUtmsToLinks();
+        appendUtmsToForms();
+      }
+    });
+
+    observer.observe(document.body, { childList: true, subtree: true });
+  }
+
+  // ─────────────────────────────────────────────
+  // INIT
+  // ─────────────────────────────────────────────
+  function init() {
+    appendUtmsToLinks();
+    appendUtmsToForms();
+    startObserver();
+    document.addEventListener('click', handleClick, true); // captura na fase de captura
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+
+})();
+</script>
+
+<!-- Meta Pixel Code -->
+<script>
+!function(f,b,e,v,n,t,s)
+{if(f.fbq)return;n=f.fbq=function(){n.callMethod?
+n.callMethod.apply(n,arguments):n.queue.push(arguments)};
+if(!f._fbq)f._fbq=n;n.push=n;n.loaded=!0;n.version='2.0';
+n.queue=[];t=b.createElement(e);t.async=!0;
+t.src=v;s=b.getElementsByTagName(e)[0];
+s.parentNode.insertBefore(t,s)}(window, document,'script',
+'https://connect.facebook.net/en_US/fbevents.js');
+fbq('init', '978168861374527');
+fbq('track', 'PageView');
+</script>
+<noscript><img height="1" width="1" style="display:none"
+src="https://www.facebook.com/tr?id=978168861374527&ev=PageView&noscript=1"
+/></noscript>
+<!-- End Meta Pixel Code -->
+
+<!-- Primary Meta Tags -->
+<title>OrbitSender - Automação Grupos de WhatsApp para Afiliados | Entrega Garantida</title>
+<meta name="title" content="OrbitSender - Automação Grupos de WhatsApp para Afiliados | Entrega Garantida" />
+<meta name="description" content="Plataforma de automação WhatsApp para afiliados. API própria, múltiplos números, IA que aumenta cliques em até 40%. Entrega garantida de mensagens e uptime de 99,9%." />
+<meta name="keywords" content="automação whatsapp, envio em massa whatsapp, afiliados, grupos whatsapp, api whatsapp, automação marketing, campanhas whatsapp, orbit sender" />
+<meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1" />
+<meta name="language" content="Portuguese" />
+<meta name="author" content="OrbitSender" />
+<meta name="theme-color" content="#6366f1" />
+
+<!-- Open Graph / Facebook / WhatsApp -->
+<meta property="og:type" content="website" />
+<meta property="og:url" content="https://orbitsender.com/" />
+<meta property="og:title" content="OrbitSender - Automação Grupos de WhatsApp para Afiliados | Entrega Garantida" />
+<meta property="og:description" content="Plataforma de automação WhatsApp para afiliados. API própria, múltiplos números, IA que aumenta cliques em até 40%. Entrega garantida de mensagens e uptime de 99,9%." />
+<meta property="og:image" content="https://orbitsender.com/imagemsocial.png" />
+<meta property="og:site_name" content="OrbitSender" />
+<meta property="og:locale" content="pt_BR" />
+
+<!-- Twitter -->
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="OrbitSender - Automação Grupos de WhatsApp para Afiliados | Entrega Garantida" />
+<meta name="twitter:description" content="Plataforma de automação WhatsApp para afiliados. API própria, múltiplos números, IA que aumenta cliques em até 40%. Entrega garantida de mensagens e uptime de 99,9%." />
+<meta name="twitter:image" content="https://orbitsender.com/imagemsocial.png" />
+
+<link rel="canonical" href="https://orbitsender.com/" />
+
+<!-- Fonts: Inter (body) + Bricolage Grotesque (headings) -->
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,200..800&family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+<!-- Tailwind (Play CDN) -->
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        fontFamily: {
+          sans: ['Inter', 'sans-serif'],
+          bricolage: ['"Bricolage Grotesque"', 'sans-serif'],
+          mono: ['"JetBrains Mono"', 'monospace'],
+        },
+      },
+    },
+  };
+</script>
+
+<!-- Lucide Icons -->
+<script src="https://unpkg.com/lucide@latest"></script>
+
+<style>
+  body {
+    font-family: 'Inter', sans-serif;
+    background-color: #0A0E1A;
+  }
+  .font-bricolage { font-family: 'Bricolage Grotesque', sans-serif !important; }
+
+  /* Premium border gradient — diagonal shimmer (OrbitSender logo mark) */
+  .border-gradient { position: relative; }
+  .border-gradient::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    padding: 1px;
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+            mask-composite: exclude;
+    background: linear-gradient(225deg, rgba(255,255,255,0) 0%, rgba(255,255,255,0.18) 50%, rgba(255,255,255,0) 100%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  /* Static gradient text (pricing heading highlight) */
+  .gradient-text-static {
+    background: linear-gradient(90deg, #818cf8, #c084fc, #f472b6);
+    -webkit-background-clip: text;
+            background-clip: text;
+    -webkit-text-fill-color: transparent;
+    color: transparent;
+  }
+
+  /* Custom glow for the electric card */
+  .electric-card {
+    box-shadow: 0 0 30px rgba(99, 102, 241, 0.3), inset 0 0 20px rgba(99, 102, 241, 0.1);
+  }
+
+  /* Starry background effect */
+  .stars {
+    background-image:
+      radial-gradient(1px 1px at 20px 30px, #fff, rgba(0,0,0,0)),
+      radial-gradient(1px 1px at 40px 70px, #ffffff, rgba(0,0,0,0)),
+      radial-gradient(1px 1px at 50px 160px, #ffffff, rgba(0,0,0,0)),
+      radial-gradient(1.5px 1.5px at 90px 40px, #ffffff, rgba(0,0,0,0)),
+      radial-gradient(1px 1px at 130px 80px, #ffffff, rgba(0,0,0,0));
+    background-size: 200px 200px;
+    opacity: 0.2;
+  }
+
+  /* Grid pattern overlay (inspirado no flux-motion) — fade radial a partir do topo */
+  .bg-grid-orbit {
+    background-image:
+      linear-gradient(to right, rgba(255,255,255,0.04) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(255,255,255,0.04) 1px, transparent 1px);
+    background-size: 64px 64px;
+    -webkit-mask-image: radial-gradient(ellipse 90% 60% at 50% 0%, #000 0%, transparent 75%);
+            mask-image: radial-gradient(ellipse 90% 60% at 50% 0%, #000 0%, transparent 75%);
+  }
+
+  /* Brilho superior que desvanece para baixo (estilo aura do flux) */
+  .hero-aura {
+    background: radial-gradient(ellipse 70% 100% at 50% 0%, rgba(99,102,241,0.28), rgba(139,92,246,0.10) 45%, transparent 70%);
+    -webkit-mask-image: linear-gradient(to bottom, #000 0%, #000 65%, transparent 100%);
+            mask-image: linear-gradient(to bottom, #000 0%, #000 65%, transparent 100%);
+    animation: auraPulse 8s ease-in-out infinite;
+  }
+  @keyframes auraPulse {
+    0%, 100% { opacity: 0.7; }
+    50% { opacity: 1; }
+  }
+
+  /* Glow no texto do título (flux text-glow) */
+  .text-glow { text-shadow: 0 0 40px rgba(129,140,248,0.35), 0 0 80px rgba(139,92,246,0.15); }
+
+  /* Hide scrollbar for clean UI look */
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+  .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+  /* Custom scrollbar */
+  ::-webkit-scrollbar { width: 10px; }
+  ::-webkit-scrollbar-track { background: #0A0E1A; }
+  ::-webkit-scrollbar-thumb { background: #27272a; border-radius: 5px; }
+  ::-webkit-scrollbar-thumb:hover { background: #3f3f46; }
+
+  html { scroll-behavior: smooth; }
+
+  /* Border gradient shared style (from design system) */
+  [style*="--border-gradient"]::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    padding: 1px;
+    border-radius: var(--border-radius-before, inherit);
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+            mask-composite: exclude;
+    background: var(--border-gradient);
+    pointer-events: none;
+  }
+
+  /* Entry animation */
+  @keyframes fadeInUpBlur {
+    0% { opacity: 0; transform: translateY(20px); filter: blur(10px); }
+    100% { opacity: 1; transform: translateY(0); filter: blur(0); }
+  }
+  .animate-entry { animation: fadeInUpBlur 1s cubic-bezier(0.2,0.8,0.2,1) both; }
+  .delay-75 { animation-delay: 75ms; }
+  .delay-100 { animation-delay: 100ms; }
+  .delay-150 { animation-delay: 150ms; }
+  .delay-200 { animation-delay: 200ms; }
+  .delay-300 { animation-delay: 300ms; }
+  .delay-500 { animation-delay: 500ms; }
+  .delay-700 { animation-delay: 700ms; }
+
+  /* Scroll-in animation */
+  @keyframes animationIn {
+    0% { opacity: 0; transform: translateY(30px); filter: blur(8px); }
+    100% { opacity: 1; transform: translateY(0); filter: blur(0px); }
+  }
+  .animate-on-scroll { animation-play-state: paused !important; }
+  .animate-on-scroll.animate { animation-play-state: running !important; }
+
+  /* Flowing dashed line for pricing connector */
+  @keyframes flow { from { stroke-dashoffset: 24; } to { stroke-dashoffset: 0; } }
+  .animate-flow { animation: flow 1s linear infinite; }
+
+  /* ===== Hero WebGL: carregamento fluido ===== */
+  /* Efeito "buraco negro" começa invisível e faz fade-in suave quando pronto */
+  #hero-fx {
+    opacity: 0;
+    transition: opacity 1.6s cubic-bezier(0.4, 0, 0.2, 1);
+    will-change: opacity;
+  }
+  #hero-fx.is-ready { opacity: 0.8; }
+
+  /* Capa preta que cobre o efeito enquanto ele carrega e some com fade */
+  #hero-loader {
+    opacity: 1;
+    transition: opacity 1.2s cubic-bezier(0.4, 0, 0.2, 1);
+    will-change: opacity;
+  }
+  #hero-loader.is-hidden {
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity 1.2s cubic-bezier(0.4, 0, 0.2, 1), visibility 0s linear 1.2s;
+  }
+
+  /* Respeita usuários que preferem menos movimento */
+  @media (prefers-reduced-motion: reduce) {
+    #hero-fx, #hero-loader { transition: opacity 0.3s ease; }
+  }
+</style>
+</head>
+
+<body class="min-h-screen overflow-x-hidden selection:bg-indigo-500/30 text-white bg-[#0A0E1A] relative">
+
+<!-- Background Gradients -->
+<div class="fixed z-0 pointer-events-none inset-0">
+  <!-- Brilho superior (aura) que desvanece para baixo -->
+  <div class="hero-aura absolute top-0 left-0 right-0 h-[760px]"></div>
+  <!-- Grade sutil com fade radial -->
+  <div class="bg-grid-orbit absolute inset-0"></div>
+  <!-- Estrelas (identidade index2) -->
+  <div class="stars absolute inset-0"></div>
+  <!-- Glow violeta no canto inferior -->
+  <div class="absolute bottom-0 right-0 w-[600px] h-[600px] bg-violet-950/25 blur-[110px] rounded-full"></div>
+</div>
+
+<!-- ============ EFEITO "BURACO NEGRO" (UnicornStudio WebGL — igual ao flux-motion) ============ -->
+<!-- Cor roxa forçada via overlay mix-blend-color (independe da cor original da cena). Ajuste o gradiente do overlay para mudar o tom. -->
+<div id="hero-fx" class="absolute top-0 left-0 w-full h-[680px] sm:h-[840px] z-0 pointer-events-none overflow-hidden">
+  <div class="absolute inset-0 isolate" style="mask-image: linear-gradient(to bottom, transparent 0%, #000 5%, #000 70%, transparent 100%); -webkit-mask-image: linear-gradient(to bottom, transparent 0%, #000 5%, #000 70%, transparent 100%)">
+    <!-- Cena WebGL. data-us-dpi/fps/scale reduzem drasticamente o uso de GPU; lazyload só inicia quando visível -->
+    <div class="absolute inset-0 [filter:brightness(1.1)]" data-us-project="HzcaAbRLaALMhHJp8gLY" data-us-dpi="1" data-us-fps="30" data-us-scale="0.7" data-us-lazyload="true"></div>
+    <!-- Overlay: força a cor para roxo/violeta (mix-blend-color) independente da cor original da cena -->
+    <div class="absolute inset-0 mix-blend-color bg-gradient-to-br from-indigo-600 via-violet-600 to-fuchsia-600"></div>
+  </div>
+</div>
+
+<!-- Capa preta: cobre o efeito enquanto o WebGL carrega e desvanece com fade -->
+<div id="hero-loader" class="absolute top-0 left-0 w-full h-[680px] sm:h-[840px] z-[5] pointer-events-none bg-[#0A0E1A]"
+     style="mask-image: linear-gradient(to bottom, #000 0%, #000 70%, transparent 100%); -webkit-mask-image: linear-gradient(to bottom, #000 0%, #000 70%, transparent 100%)"></div>
+
+<script type="text/javascript">
+  (function () {
+    var revealed = false;
+
+    // Revela o efeito (fade-in) e esconde a capa preta (fade-out)
+    function reveal() {
+      if (revealed) return;
+      revealed = true;
+      var fx = document.getElementById('hero-fx');
+      var loader = document.getElementById('hero-loader');
+      if (fx) fx.classList.add('is-ready');
+      if (loader) loader.classList.add('is-hidden');
+    }
+
+    function startScene() {
+      try {
+        var p = UnicornStudio.init();
+        // init() devolve uma Promise nas versões 1.4.x — espera resolver + um respiro
+        // para o primeiro frame renderizar antes de revelar.
+        if (p && typeof p.then === 'function') {
+          p.then(function () { setTimeout(reveal, 450); }).catch(reveal);
+        } else {
+          setTimeout(reveal, 900);
+        }
+      } catch (e) { reveal(); }
+      window.UnicornStudio.isInitialized = true;
+    }
+
+    function boot() {
+      if (!window.UnicornStudio) {
+        window.UnicornStudio = { isInitialized: false };
+        var s = document.createElement('script');
+        s.src = "https://cdn.jsdelivr.net/gh/hiunicornstudio/unicornstudio.js@v1.4.29/dist/unicornStudio.umd.js";
+        s.onload = function () { if (!window.UnicornStudio.isInitialized) startScene(); };
+        s.onerror = reveal; // se a CDN falhar, ainda some a capa (não trava a hero)
+        (document.head || document.body).appendChild(s);
+      } else if (!window.UnicornStudio.isInitialized) {
+        startScene();
+      } else {
+        reveal();
+      }
+
+      // Garantia: a capa nunca fica presa por mais de 3,5s aconteça o que acontecer
+      setTimeout(reveal, 3500);
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', boot);
+    } else {
+      boot();
+    }
+  })();
+</script>
+
+<!-- ============ NAVIGATION ============ -->
+<header class="relative z-50">
+  <nav class="relative z-50 flex items-center justify-between px-6 py-6 max-w-7xl mx-auto border-b border-white/5 animate-entry delay-75">
+    <!-- Logo -->
+    <a href="#hero" class="flex gap-2 items-center group">
+      <div class="border-gradient bg-white/10 w-8 h-8 rounded-full flex items-center justify-center backdrop-blur-sm group-hover:bg-white/15 transition-colors duration-200">
+        <i data-lucide="rocket" class="w-3.5 h-3.5 text-white"></i>
+      </div>
+      <span class="text-base font-semibold tracking-tight text-white">Orbit<span class="text-indigo-400">Sender</span></span>
+    </a>
+
+    <!-- Center Menu -->
+    <div class="hidden md:flex items-center bg-white/5 border border-white/10 rounded-full px-1 py-1 backdrop-blur-md">
+      <a class="px-4 py-1.5 text-xs text-neutral-400 hover:text-white transition-colors" href="#diferenciais">Diferenciais</a>
+      <a class="px-4 py-1.5 text-xs text-neutral-400 hover:text-white transition-colors" href="#funcionalidades">Funcionalidades</a>
+      <a class="px-4 py-1.5 text-xs text-neutral-400 hover:text-white transition-colors" href="#precos">Preços</a>
+      <a class="px-4 py-1.5 text-xs text-neutral-400 hover:text-white transition-colors" href="#faq">FAQ</a>
+    </div>
+
+    <!-- Right Actions -->
+    <div class="hidden md:flex items-center gap-4">
+      <a href="https://app.orbitsender.com/login" class="text-sm text-neutral-400 hover:text-white transition-colors">Entrar</a>
+      <a href="#precos" class="hover:brightness-110 transition-all text-sm text-white bg-gradient-to-b from-indigo-400 to-indigo-600 border-t border-white/20 rounded-full px-5 py-2 shadow-[0_0_15px_-3px_rgba(99, 102, 241,0.4)]">
+        Começar Agora
+      </a>
+    </div>
+
+    <!-- Mobile menu button -->
+    <button id="menu-btn" class="md:hidden text-neutral-300 hover:text-white p-2" aria-label="Abrir menu">
+      <i data-lucide="menu" class="w-6 h-6"></i>
+    </button>
+  </nav>
+
+  <!-- Mobile menu -->
+  <div id="mobile-menu" class="hidden md:hidden mx-4 mt-2 rounded-2xl bg-[#0d1322]/95 backdrop-blur-lg border border-white/10 p-4 absolute left-0 right-0 z-50 shadow-2xl">
+    <div class="flex flex-col gap-1">
+      <a href="#diferenciais" class="px-3 py-3 text-sm text-neutral-300 hover:text-white hover:bg-white/5 rounded-xl transition-colors">Diferenciais</a>
+      <a href="#funcionalidades" class="px-3 py-3 text-sm text-neutral-300 hover:text-white hover:bg-white/5 rounded-xl transition-colors">Funcionalidades</a>
+      <a href="#precos" class="px-3 py-3 text-sm text-neutral-300 hover:text-white hover:bg-white/5 rounded-xl transition-colors">Preços</a>
+      <a href="#faq" class="px-3 py-3 text-sm text-neutral-300 hover:text-white hover:bg-white/5 rounded-xl transition-colors">FAQ</a>
+      <div class="pt-3 mt-2 border-t border-white/10 flex flex-col gap-2.5">
+        <a href="https://app.orbitsender.com/login" class="text-center text-neutral-400 hover:text-white py-2 text-sm">Entrar</a>
+        <a href="#precos" class="text-center rounded-full bg-gradient-to-b from-indigo-400 to-indigo-600 text-white py-3 text-sm font-medium">Começar Agora</a>
+      </div>
+    </div>
+  </div>
+</header>
+
+<!-- ============ HERO ============ -->
+<section id="hero" class="relative z-10">
+  <div class="max-w-7xl mx-auto px-6 pt-16 lg:pt-24 pb-12 sm:pb-20 relative z-10">
+
+    <!-- Headline + Subhead (centered, igual ao original) -->
+    <div class="text-center max-w-4xl mx-auto">
+      <h1 class="text-glow text-3xl sm:text-4xl lg:text-[52px] leading-[1.08] text-white mb-6 font-bricolage font-semibold tracking-tight animate-entry delay-100">
+        Seus grupos vendendo todos os dias
+        <span class="block text-transparent bg-clip-text bg-gradient-to-r from-indigo-300 via-violet-400 to-pink-400">mesmo quando você não está online</span>
+      </h1>
+      <p class="text-lg text-neutral-400 max-w-xl mx-auto leading-relaxed animate-entry delay-200">
+        Enquanto você ainda está procurando produto…
+        <span class="text-white font-medium">tem gente rodando 100+ ofertas por dia no automático</span>
+        e acumulando comissão.
+      </p>
+    </div>
+
+    <!-- Flow Steps: encontra / adapta / envia -->
+    <div class="mt-16 grid grid-cols-1 md:grid-cols-3 gap-6">
+      <!-- encontra -->
+      <div class="group relative bg-[#0d1322]/40 backdrop-blur-2xl border border-white/10 hover:border-indigo-500/40 hover:bg-[#0d1322]/55 rounded-3xl p-8 flex flex-col transition-all duration-500 hover:-translate-y-1 shadow-[0_8px_40px_-12px_rgba(99,102,241,0.25)]">
+        <div class="flex items-center gap-4 mb-6">
+          <div class="w-12 h-12 rounded-xl ring-1 ring-indigo-500/25 bg-indigo-500/10 flex items-center justify-center shrink-0">
+            <i data-lucide="search" class="w-5 h-5 text-indigo-400"></i>
+          </div>
+          <span class="font-bricolage text-xl uppercase tracking-tight text-indigo-400">encontra</span>
+        </div>
+        <div class="flex-grow">
+          <p class="text-white text-base font-semibold leading-snug mb-3">iPhone 15 -38% na Shopee</p>
+          <p class="text-neutral-400 text-sm leading-relaxed mb-6">Monitorou 8 grupos e detectou a oferta em tempo real</p>
+        </div>
+        <div class="mt-auto">
+          <span class="inline-flex items-center gap-1.5 text-[10px] font-bold px-3 py-1.5 rounded-full uppercase tracking-wider bg-indigo-500/15 text-indigo-300">
+            <span class="w-1.5 h-1.5 rounded-full bg-current"></span>
+            12 ofertas hoje
+          </span>
+        </div>
+      </div>
+      <!-- adapta -->
+      <div class="group relative bg-[#0d1322]/40 backdrop-blur-2xl border border-white/10 hover:border-indigo-500/40 hover:bg-[#0d1322]/55 rounded-3xl p-8 flex flex-col transition-all duration-500 hover:-translate-y-1 shadow-[0_8px_40px_-12px_rgba(99,102,241,0.25)]">
+        <div class="flex items-center gap-4 mb-6">
+          <div class="w-12 h-12 rounded-xl ring-1 ring-indigo-500/25 bg-indigo-500/10 flex items-center justify-center shrink-0">
+            <i data-lucide="wand-2" class="w-5 h-5 text-indigo-400"></i>
+          </div>
+          <span class="font-bricolage text-xl uppercase tracking-tight text-indigo-400">adapta</span>
+        </div>
+        <div class="flex-grow">
+          <p class="text-white text-base font-semibold leading-snug mb-3">"🚨 ACHADO! iPhone -38%! Estoque acabando…"</p>
+          <p class="text-neutral-400 text-sm leading-relaxed mb-6">IA reescreveu em 9 estilos pra aumentar o clique em até 40%</p>
+        </div>
+        <div class="mt-auto">
+          <span class="inline-flex items-center gap-1.5 text-[10px] font-bold px-3 py-1.5 rounded-full uppercase tracking-wider bg-indigo-500/15 text-indigo-300">
+            <span class="w-1.5 h-1.5 rounded-full bg-current"></span>
+            +40% de cliques
+          </span>
+        </div>
+      </div>
+      <!-- envia -->
+      <div class="group relative bg-[#0d1322]/40 backdrop-blur-2xl border border-white/10 hover:border-indigo-500/40 hover:bg-[#0d1322]/55 rounded-3xl p-8 flex flex-col transition-all duration-500 hover:-translate-y-1 shadow-[0_8px_40px_-12px_rgba(99,102,241,0.25)]">
+        <div class="flex items-center gap-4 mb-6">
+          <div class="w-12 h-12 rounded-xl ring-1 ring-indigo-500/25 bg-indigo-500/10 flex items-center justify-center shrink-0">
+            <i data-lucide="send" class="w-5 h-5 text-indigo-400"></i>
+          </div>
+          <span class="font-bricolage text-xl uppercase tracking-tight text-indigo-400">envia</span>
+        </div>
+        <div class="flex-grow">
+          <p class="text-white text-base font-semibold leading-snug mb-3">Disparado para 34 grupos</p>
+          <p class="text-neutral-400 text-sm leading-relaxed mb-6">2.400 membros alcançados — tudo automático, sem você tocar</p>
+        </div>
+        <div class="mt-auto">
+          <span class="inline-flex items-center gap-1.5 text-[10px] font-bold px-3 py-1.5 rounded-full uppercase tracking-wider bg-indigo-500/15 text-indigo-300">
+            <span class="w-1.5 h-1.5 rounded-full bg-current"></span>
+            98% entregues
+          </span>
+        </div>
+      </div>
+    </div>
+
+    <!-- CTA (único, igual ao original) -->
+    <div class="flex justify-center mt-14 px-2">
+      <a href="#precos" class="group relative inline-flex w-full sm:w-auto items-center justify-center text-center gap-2.5 rounded-full bg-gradient-to-t from-indigo-500 via-violet-500 to-purple-600 px-6 sm:px-10 py-3.5 sm:py-4 text-sm sm:text-base font-medium text-white shadow-[0_0_40px_-5px_rgba(99,102,241,0.6)] ring-1 ring-inset ring-white/40 transition-all duration-300 hover:scale-105 hover:shadow-[0_0_60px_-5px_rgba(99,102,241,0.8)]">
+        Quero vender mais todos os dias
+        <i data-lucide="send" class="w-4 h-4 group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform"></i>
+      </a>
+    </div>
+  </div>
+</section>
+
+<!-- ============ PAIN BLOCK ============ -->
+<section class="max-w-7xl mx-auto px-6 py-12 sm:py-20 relative z-10">
+  <div class="text-center max-w-4xl mx-auto mb-16">
+    <h2 class="text-3xl md:text-5xl text-white font-bricolage font-light tracking-tight mb-6 leading-[1.1]">
+      O problema não é <span class="text-indigo-400">falta de grupo.</span><br />É falta de consistência.
+    </h2>
+    <p class="text-neutral-400 text-lg max-w-2xl mx-auto leading-relaxed">
+      Vamos ser diretos: o jogo de afiliados hoje exige volume e presença 24h. Cada minuto offline é uma venda que você entrega de graça.
+    </p>
+  </div>
+
+  <div class="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+    <!-- Pain list -->
+    <div class="lg:col-span-5">
+      <div class="bg-[#0d1322] border border-white/10 rounded-3xl p-8 h-full">
+        <h3 class="text-white font-semibold text-xl mb-6 flex items-center gap-2">
+          <i data-lucide="alert-circle" class="w-5 h-5 text-indigo-500"></i>
+          O que trava sua escala:
+        </h3>
+        <ul class="space-y-4">
+          <li class="flex items-start gap-4 text-neutral-300 text-base leading-relaxed"><span class="w-1.5 h-1.5 rounded-full bg-indigo-500 mt-2.5 shrink-0"></span>Você não consegue postar o dia todo</li>
+          <li class="flex items-start gap-4 text-neutral-300 text-base leading-relaxed"><span class="w-1.5 h-1.5 rounded-full bg-indigo-500 mt-2.5 shrink-0"></span>Perde as melhores promoções relâmpago</li>
+          <li class="flex items-start gap-4 text-neutral-300 text-base leading-relaxed"><span class="w-1.5 h-1.5 rounded-full bg-indigo-500 mt-2.5 shrink-0"></span>Fica horas garimpando em vez de vender</li>
+          <li class="flex items-start gap-4 text-neutral-300 text-base leading-relaxed"><span class="w-1.5 h-1.5 rounded-full bg-indigo-500 mt-2.5 shrink-0"></span>E no fim… vê o concorrente levar a venda</li>
+        </ul>
+        <div class="mt-10 pt-8 border-t border-white/5">
+          <p class="text-neutral-500 text-sm italic">E cada vez que você para:</p>
+          <div class="flex items-center gap-3 mt-3">
+            <div class="w-8 h-px bg-indigo-500/50"></div>
+            <p class="text-white font-semibold text-lg">alguém vende no seu lugar</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Loss metrics -->
+    <div class="lg:col-span-7">
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div class="p-6 rounded-3xl bg-[#0d1322] border border-white/10 hover:border-white/20 transition-colors">
+          <div class="flex items-center justify-between mb-4">
+            <div class="w-10 h-10 rounded-xl bg-white/5 flex items-center justify-center"><i data-lucide="clock" class="w-5 h-5 text-indigo-400"></i></div>
+            <div class="text-right"><span class="block text-white text-xl font-bold tabular-nums">4h</span><span class="text-neutral-500 text-[10px] uppercase tracking-widest font-bold">perdidas</span></div>
+          </div>
+          <p class="text-neutral-400 text-sm font-medium mb-4">Horas garimpando hoje</p>
+          <div class="h-1.5 bg-white/5 rounded-full overflow-hidden"><div class="h-full bg-indigo-400 rounded-full" style="width:80%"></div></div>
+        </div>
+        <div class="p-6 rounded-3xl bg-[#0d1322] border border-white/10 hover:border-white/20 transition-colors">
+          <div class="flex items-center justify-between mb-4">
+            <div class="w-10 h-10 rounded-xl bg-white/5 flex items-center justify-center"><i data-lucide="zap" class="w-5 h-5 text-indigo-400"></i></div>
+            <div class="text-right"><span class="block text-white text-xl font-bold tabular-nums">12</span><span class="text-neutral-500 text-[10px] uppercase tracking-widest font-bold">hoje</span></div>
+          </div>
+          <p class="text-neutral-400 text-sm font-medium mb-4">Promoções perdidas</p>
+          <div class="h-1.5 bg-white/5 rounded-full overflow-hidden"><div class="h-full bg-indigo-500 rounded-full" style="width:60%"></div></div>
+        </div>
+        <div class="p-6 rounded-3xl bg-[#0d1322] border border-white/10 hover:border-white/20 transition-colors">
+          <div class="flex items-center justify-between mb-4">
+            <div class="w-10 h-10 rounded-xl bg-white/5 flex items-center justify-center"><i data-lucide="trending-down" class="w-5 h-5 text-indigo-400"></i></div>
+            <div class="text-right"><span class="block text-white text-xl font-bold tabular-nums">R$ ???</span><span class="text-neutral-500 text-[10px] uppercase tracking-widest font-bold">este mês</span></div>
+          </div>
+          <p class="text-neutral-400 text-sm font-medium mb-4">Comissão não gerada</p>
+          <div class="h-1.5 bg-white/5 rounded-full overflow-hidden"><div class="h-full bg-indigo-600 rounded-full" style="width:95%"></div></div>
+        </div>
+        <div class="p-6 rounded-3xl bg-[#0d1322] border border-white/10 hover:border-white/20 transition-colors">
+          <div class="flex items-center justify-between mb-4">
+            <div class="w-10 h-10 rounded-xl bg-white/5 flex items-center justify-center"><i data-lucide="search" class="w-5 h-5 text-neutral-500"></i></div>
+            <div class="text-right"><span class="block text-white text-xl font-bold tabular-nums">∞</span><span class="text-neutral-500 text-[10px] uppercase tracking-widest font-bold">neste momento</span></div>
+          </div>
+          <p class="text-neutral-400 text-sm font-medium mb-4">Concorrentes ativos</p>
+          <div class="h-1.5 bg-white/5 rounded-full overflow-hidden"><div class="h-full bg-neutral-500 rounded-full" style="width:100%"></div></div>
+        </div>
+        <div class="sm:col-span-2 p-5 rounded-2xl border border-indigo-500/20 bg-indigo-500/[0.05] flex items-center justify-between gap-4">
+          <div class="flex items-center gap-3">
+            <span class="w-2 h-2 rounded-full bg-indigo-500 animate-ping"></span>
+            <p class="text-indigo-300 text-sm font-semibold italic">Promoção relâmpago expirada enquanto você estava offline</p>
+          </div>
+          <span class="text-[10px] font-mono font-bold text-indigo-500/60 uppercase tracking-widest">- R$ COMISSÃO</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ BREAK BLOCK ============ -->
+<section class="max-w-7xl mx-auto px-6 py-12 sm:py-20 relative z-10">
+  <div class="grid grid-cols-1 md:grid-cols-2 gap-10 lg:gap-16 items-stretch">
+    <!-- Manual -->
+    <div class="flex flex-col h-full">
+      <h2 class="text-2xl sm:text-3xl lg:text-4xl font-bricolage font-light tracking-tight text-neutral-600 line-through decoration-indigo-500/40 mb-8 text-center md:text-left">Quem escala posta.</h2>
+      <div class="flex-1 bg-[#0d1322] border border-indigo-900/30 rounded-3xl p-6 sm:p-10 flex flex-col items-center gap-6 opacity-80 hover:opacity-100 transition-all duration-500">
+        <div class="w-16 h-16 rounded-2xl bg-indigo-900/20 ring-1 ring-indigo-900/40 flex items-center justify-center"><i data-lucide="user" class="w-7 h-7 text-indigo-300/70"></i></div>
+        <div class="text-center">
+          <p class="text-white text-xl font-semibold mb-1">Operação Manual</p>
+          <p class="text-neutral-500 text-[10px] uppercase tracking-[0.2em] font-bold">Depende de você</p>
+        </div>
+        <div class="w-full space-y-2.5 mt-auto">
+          <div class="h-10 rounded-xl text-xs flex items-center justify-between px-4 border bg-white/[0.05] border-white/10 text-neutral-300"><span class="font-mono font-bold">manhã</span><span class="font-bold uppercase text-[10px] tracking-widest">postando</span></div>
+          <div class="h-10 rounded-xl text-xs flex items-center justify-between px-4 border bg-white/[0.05] border-white/10 text-neutral-300"><span class="font-mono font-bold">tarde</span><span class="font-bold uppercase text-[10px] tracking-widest">postando</span></div>
+          <div class="h-10 rounded-xl text-xs flex items-center justify-between px-4 border bg-transparent border-white/[0.03] text-neutral-700"><span class="font-mono font-bold">noite</span><span class="font-bold uppercase text-[10px] tracking-widest">cansado</span></div>
+          <div class="h-10 rounded-xl text-xs flex items-center justify-between px-4 border bg-transparent border-white/[0.03] text-neutral-700"><span class="font-mono font-bold">madrugada</span><span class="font-bold uppercase text-[10px] tracking-widest">dormindo</span></div>
+          <div class="h-10 rounded-xl text-xs flex items-center justify-between px-4 border bg-transparent border-white/[0.03] text-neutral-700"><span class="font-mono font-bold">final de semana</span><span class="font-bold uppercase text-[10px] tracking-widest">offline</span></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- System -->
+    <div class="flex flex-col h-full">
+      <h2 class="text-2xl sm:text-3xl lg:text-4xl font-bricolage font-light tracking-tight text-white mb-8 text-center md:text-left">Quem escala <span class="text-indigo-400 italic">opera sistema.</span></h2>
+      <div class="flex-1 bg-neutral-900 rounded-3xl p-[2px] electric-card overflow-hidden relative">
+        <div class="absolute inset-0 bg-gradient-to-b from-indigo-400 via-violet-500 to-transparent opacity-60 z-0"></div>
+        <div class="relative z-10 bg-[#0d1322] rounded-[22px] h-full p-6 sm:p-10 flex flex-col items-center gap-6">
+          <div class="w-16 h-16 rounded-2xl bg-indigo-500/20 ring-1 ring-indigo-500/40 flex items-center justify-center"><i data-lucide="settings" class="w-7 h-7 text-indigo-400 animate-spin [animation-duration:10s]"></i></div>
+          <div class="text-center">
+            <p class="text-white text-xl font-semibold mb-1">Orbit System</p>
+            <p class="text-indigo-400 text-[10px] uppercase tracking-[0.2em] font-bold">Roda 24h por dia</p>
+          </div>
+          <div class="w-full space-y-2.5 mt-auto">
+            <div class="h-10 rounded-xl bg-indigo-500/[0.12] border border-indigo-500/30 text-xs flex items-center justify-between px-4"><span class="text-indigo-200 font-mono font-bold">00h</span><div class="flex items-center gap-2.5"><span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span><span class="text-emerald-400 font-bold uppercase text-[10px] tracking-widest">Rodando</span></div></div>
+            <div class="h-10 rounded-xl bg-indigo-500/[0.12] border border-indigo-500/30 text-xs flex items-center justify-between px-4"><span class="text-indigo-200 font-mono font-bold">06h</span><div class="flex items-center gap-2.5"><span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span><span class="text-emerald-400 font-bold uppercase text-[10px] tracking-widest">Rodando</span></div></div>
+            <div class="h-10 rounded-xl bg-indigo-500/[0.12] border border-indigo-500/30 text-xs flex items-center justify-between px-4"><span class="text-indigo-200 font-mono font-bold">12h</span><div class="flex items-center gap-2.5"><span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span><span class="text-emerald-400 font-bold uppercase text-[10px] tracking-widest">Rodando</span></div></div>
+            <div class="h-10 rounded-xl bg-indigo-500/[0.12] border border-indigo-500/30 text-xs flex items-center justify-between px-4"><span class="text-indigo-200 font-mono font-bold">18h</span><div class="flex items-center gap-2.5"><span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span><span class="text-emerald-400 font-bold uppercase text-[10px] tracking-widest">Rodando</span></div></div>
+            <div class="h-10 rounded-xl bg-indigo-500/[0.12] border border-indigo-500/30 text-xs flex items-center justify-between px-4"><span class="text-indigo-200 font-mono font-bold">24h</span><div class="flex items-center gap-2.5"><span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span><span class="text-emerald-400 font-bold uppercase text-[10px] tracking-widest">Rodando</span></div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="mt-16 text-center">
+    <div class="inline-block px-6 sm:px-10 py-6 sm:py-8 rounded-[2rem] sm:rounded-[2.5rem] bg-white/[0.03] border border-white/10 backdrop-blur-md">
+      <p class="text-neutral-400 text-lg sm:text-xl lg:text-2xl leading-relaxed mb-4">Se você depende de você pra postar… <span class="text-white font-semibold">você nunca vai escalar.</span></p>
+      <p class="text-indigo-400 font-bricolage font-light text-2xl sm:text-3xl lg:text-4xl uppercase tracking-tight">Simples assim.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ MECHANISM BLOCK ============ -->
+<section class="max-w-7xl mx-auto px-6 py-12 sm:py-20 relative z-10">
+  <div class="text-center mb-12">
+    <h2 class="text-3xl sm:text-4xl md:text-5xl text-white font-bricolage font-light tracking-tight mb-4">Como seus grupos começam a <span class="text-indigo-400">vender sozinhos</span></h2>
+    <p class="text-neutral-400 text-base max-w-md mx-auto leading-relaxed">O OrbitSender roda em loop — 24 horas por dia, sem esforço, sem atraso, sem perda de timing.</p>
+  </div>
+
+  <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 sm:gap-6 mb-8">
+    <div class="bg-[#0d1322] border border-white/10 hover:border-indigo-500/30 rounded-2xl p-5 flex flex-col items-center gap-3 text-center transition-colors">
+      <div class="w-12 h-12 rounded-xl ring-1 ring-indigo-500/25 bg-indigo-500/10 flex items-center justify-center"><i data-lucide="eye" class="w-5 h-5 text-indigo-400"></i></div>
+      <div><p class="text-white font-semibold text-sm">Monitora</p><p class="text-neutral-500 text-xs mt-0.5 leading-relaxed">grupos que já convertem</p></div>
+      <div class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border border-indigo-500/20 bg-indigo-500/10 text-indigo-400 text-[9px] font-mono"><span class="w-1 h-1 rounded-full bg-indigo-400"></span>01</div>
+    </div>
+    <div class="bg-[#0d1322] border border-white/10 hover:border-indigo-500/30 rounded-2xl p-5 flex flex-col items-center gap-3 text-center transition-colors">
+      <div class="w-12 h-12 rounded-xl ring-1 ring-indigo-500/25 bg-indigo-500/10 flex items-center justify-center"><i data-lucide="target" class="w-5 h-5 text-indigo-400"></i></div>
+      <div><p class="text-white font-semibold text-sm">Identifica</p><p class="text-neutral-500 text-xs mt-0.5 leading-relaxed">as melhores ofertas</p></div>
+      <div class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border border-indigo-500/20 bg-indigo-500/10 text-indigo-400 text-[9px] font-mono"><span class="w-1 h-1 rounded-full bg-indigo-400"></span>02</div>
+    </div>
+    <div class="bg-[#0d1322] border border-white/10 hover:border-indigo-500/30 rounded-2xl p-5 flex flex-col items-center gap-3 text-center transition-colors">
+      <div class="w-12 h-12 rounded-xl ring-1 ring-indigo-500/25 bg-indigo-500/10 flex items-center justify-center"><i data-lucide="wand-2" class="w-5 h-5 text-indigo-400"></i></div>
+      <div><p class="text-white font-semibold text-sm">Reescreve</p><p class="text-neutral-500 text-xs mt-0.5 leading-relaxed">com IA pra aumentar clique</p></div>
+      <div class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border border-indigo-500/20 bg-indigo-500/10 text-indigo-400 text-[9px] font-mono"><span class="w-1 h-1 rounded-full bg-indigo-400"></span>03</div>
+    </div>
+    <div class="bg-[#0d1322] border border-white/10 hover:border-indigo-500/30 rounded-2xl p-5 flex flex-col items-center gap-3 text-center transition-colors">
+      <div class="w-12 h-12 rounded-xl ring-1 ring-indigo-500/25 bg-indigo-500/10 flex items-center justify-center"><i data-lucide="send" class="w-5 h-5 text-indigo-400"></i></div>
+      <div><p class="text-white font-semibold text-sm">Dispara</p><p class="text-neutral-500 text-xs mt-0.5 leading-relaxed">automaticamente nos seus grupos</p></div>
+      <div class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border border-indigo-500/20 bg-indigo-500/10 text-indigo-400 text-[9px] font-mono"><span class="w-1 h-1 rounded-full bg-indigo-400"></span>04</div>
+    </div>
+  </div>
+
+  <div class="max-w-2xl mx-auto">
+    <div class="bg-indigo-500/[0.04] border border-indigo-500/15 rounded-2xl p-5">
+      <div class="flex flex-wrap justify-center gap-x-6 gap-y-2 text-xs text-neutral-400">
+        <span class="flex items-center gap-1.5"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>24 horas por dia</span>
+        <span class="flex items-center gap-1.5"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>Sem esforço</span>
+        <span class="flex items-center gap-1.5"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>Sem atraso</span>
+        <span class="flex items-center gap-1.5"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>Sem perda de timing</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ RESULT BLOCK ============ -->
+<section class="max-w-7xl mx-auto px-6 py-12 sm:py-20 relative z-10">
+  <div class="text-center mb-12">
+    <h2 class="text-3xl md:text-5xl text-white font-bricolage font-light tracking-tight mb-4">Mais envio = <span class="text-indigo-400">mais clique</span> = <span class="text-indigo-400">mais comissão</span></h2>
+    <p class="text-neutral-400 text-base max-w-md mx-auto">Não é sobre achar "o produto perfeito". É sobre <span class="text-white font-medium">volume + consistência.</span></p>
+  </div>
+
+  <div class="grid grid-cols-1 sm:grid-cols-3 gap-6 mb-8">
+    <div class="bg-[#0d1322] border border-white/10 rounded-2xl p-7 text-center hover:border-indigo-500/30 hover:-translate-y-0.5 transition-all">
+      <div class="w-12 h-12 rounded-xl bg-indigo-500/15 ring-1 ring-indigo-500/20 flex items-center justify-center mx-auto mb-5"><i data-lucide="radio" class="w-5 h-5 text-indigo-400"></i></div>
+      <p class="text-4xl sm:text-5xl font-bricolage font-light text-white mb-1 tabular-nums">120<span class="text-2xl text-indigo-400">+</span></p>
+      <p class="text-white font-semibold text-sm mb-1">Mais frequência</p>
+      <p class="text-neutral-500 text-xs">promoções enviadas por dia</p>
+      <div class="mt-5 h-1.5 bg-white/5 rounded-full overflow-hidden"><div class="h-full bg-gradient-to-r from-indigo-500 to-indigo-400 rounded-full" style="width:100%"></div></div>
+    </div>
+    <div class="bg-[#0d1322] border border-white/10 rounded-2xl p-7 text-center hover:border-indigo-500/30 hover:-translate-y-0.5 transition-all">
+      <div class="w-12 h-12 rounded-xl bg-indigo-500/15 ring-1 ring-indigo-500/20 flex items-center justify-center mx-auto mb-5"><i data-lucide="zap" class="w-5 h-5 text-violet-400"></i></div>
+      <p class="text-4xl sm:text-5xl font-bricolage font-light text-white mb-1 tabular-nums">100<span class="text-2xl text-violet-400">%</span></p>
+      <p class="text-white font-semibold text-sm mb-1">Mais velocidade</p>
+      <p class="text-neutral-500 text-xs">automático, sem esperar você</p>
+      <div class="mt-5 h-1.5 bg-white/5 rounded-full overflow-hidden"><div class="h-full bg-gradient-to-r from-violet-500 to-violet-400 rounded-full" style="width:100%"></div></div>
+    </div>
+    <div class="bg-[#0d1322] border border-white/10 rounded-2xl p-7 text-center hover:border-indigo-500/30 hover:-translate-y-0.5 transition-all">
+      <div class="w-12 h-12 rounded-xl bg-emerald-500/15 ring-1 ring-emerald-500/20 flex items-center justify-center mx-auto mb-5"><i data-lucide="trending-up" class="w-5 h-5 text-emerald-400"></i></div>
+      <p class="text-4xl sm:text-5xl font-bricolage font-light text-white mb-1 tabular-nums">98<span class="text-2xl text-emerald-400">%</span></p>
+      <p class="text-white font-semibold text-sm mb-1">Mais presença</p>
+      <p class="text-neutral-500 text-xs">de entrega garantida nos grupos</p>
+      <div class="mt-5 h-1.5 bg-white/5 rounded-full overflow-hidden"><div class="h-full bg-gradient-to-r from-emerald-500 to-emerald-400 rounded-full" style="width:98%"></div></div>
+    </div>
+  </div>
+
+  <div class="max-w-sm mx-auto">
+    <div class="bg-emerald-500/[0.06] border border-emerald-500/20 rounded-2xl p-5 text-center">
+      <p class="text-neutral-400 text-xs mb-1.5">e isso vira</p>
+      <div class="flex items-center justify-center gap-2 text-emerald-400 mb-1"><i data-lucide="banknote" class="w-5 h-5"></i><p class="text-white font-semibold text-xl tracking-tight uppercase">Dinheiro</p></div>
+      <p class="text-neutral-500 text-xs mt-1">todos os dias, no automático</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ WHY ORBIT / DIFERENCIAIS (01.) ============ -->
+<section id="diferenciais" class="[animation:animationIn_0.8s_ease-out_0.1s_both] animate-on-scroll bg-gradient-to-tr from-white/0 via-white/[0.04] to-white/0 max-w-7xl rounded-3xl mt-8 sm:mt-12 mb-8 sm:mb-12 mx-2.5 lg:mx-auto p-6 sm:p-10 relative z-10" style="--border-gradient: linear-gradient(45deg, rgba(255,255,255,0), rgba(255,255,255,0.1), rgba(255,255,255,0)); --border-radius-before: 24px">
+  <div class="flex flex-col lg:flex-row gap-4 mb-12 items-start lg:items-center">
+    <span class="text-6xl sm:text-7xl lg:text-8xl text-white/5 font-bricolage font-light tracking-tight">01.</span>
+    <div class="space-y-2">
+      <h2 class="text-3xl md:text-5xl text-white font-bricolage font-light tracking-tight">Enquanto outras ferramentas travam… <span class="text-indigo-400">você continua vendendo</span></h2>
+      <p class="leading-relaxed text-lg text-neutral-400 max-w-2xl">A maioria para no meio do envio. E você nem percebe. Resultado: <span class="text-white font-medium">mensagem não chega, venda não acontece.</span></p>
+    </div>
+  </div>
+
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
+    <!-- Comparison -->
+    <div class="space-y-4">
+      <div class="bg-[#0d1322] border border-white/10 rounded-3xl p-8">
+        <h3 class="text-sm font-semibold text-neutral-500 mb-6 flex items-center gap-2 font-mono uppercase tracking-widest"><i data-lucide="x-circle" class="w-4 h-4 text-red-500/70"></i>Outras ferramentas</h3>
+        <ul class="space-y-3.5">
+          <li class="flex items-start gap-3 text-neutral-500 text-sm"><i data-lucide="x-circle" class="w-4 h-4 text-red-500/50 shrink-0 mt-0.5"></i><span>Para no meio do envio — você não percebe</span></li>
+          <li class="flex items-start gap-3 text-neutral-500 text-sm"><i data-lucide="x-circle" class="w-4 h-4 text-red-500/50 shrink-0 mt-0.5"></i><span>Mensagem não chega, venda não acontece</span></li>
+          <li class="flex items-start gap-3 text-neutral-500 text-sm"><i data-lucide="x-circle" class="w-4 h-4 text-red-500/50 shrink-0 mt-0.5"></i><span>Um único número — tudo ou nada</span></li>
+          <li class="flex items-start gap-3 text-neutral-500 text-sm"><i data-lucide="x-circle" class="w-4 h-4 text-red-500/50 shrink-0 mt-0.5"></i><span>Sistema cai e perde o timing da oferta</span></li>
+          <li class="flex items-start gap-3 text-neutral-500 text-sm"><i data-lucide="x-circle" class="w-4 h-4 text-red-500/50 shrink-0 mt-0.5"></i><span>Sem fallback — sem redundância</span></li>
+          <li class="flex items-start gap-3 text-neutral-500 text-sm"><i data-lucide="x-circle" class="w-4 h-4 text-red-500/50 shrink-0 mt-0.5"></i><span>API pública que trava quando mais precisa</span></li>
+          <li class="flex items-start gap-3 text-neutral-500 text-sm"><i data-lucide="x-circle" class="w-4 h-4 text-red-500/50 shrink-0 mt-0.5"></i><span>Você depende de estabilidade que não existe</span></li>
+        </ul>
+      </div>
+      <div class="bg-indigo-500/[0.06] border border-indigo-500/20 rounded-3xl p-8">
+        <h3 class="text-sm font-semibold text-indigo-300 mb-6 flex items-center gap-2 font-mono uppercase tracking-widest"><i data-lucide="check-circle-2" class="w-4 h-4 text-indigo-400"></i>OrbitSender</h3>
+        <ul class="space-y-3.5">
+          <li class="flex items-start gap-3 text-white text-sm font-medium"><i data-lucide="check-circle-2" class="w-4 h-4 text-emerald-400 shrink-0 mt-0.5"></i><span>Fallback automático — outro número assume em segundos</span></li>
+          <li class="flex items-start gap-3 text-white text-sm font-medium"><i data-lucide="check-circle-2" class="w-4 h-4 text-emerald-400 shrink-0 mt-0.5"></i><span>Mensagem chegando mesmo com instabilidade</span></li>
+          <li class="flex items-start gap-3 text-white text-sm font-medium"><i data-lucide="check-circle-2" class="w-4 h-4 text-emerald-400 shrink-0 mt-0.5"></i><span>Múltiplos números — operação contínua</span></li>
+          <li class="flex items-start gap-3 text-white text-sm font-medium"><i data-lucide="check-circle-2" class="w-4 h-4 text-emerald-400 shrink-0 mt-0.5"></i><span>Você não perde comissão por falha técnica</span></li>
+          <li class="flex items-start gap-3 text-white text-sm font-medium"><i data-lucide="check-circle-2" class="w-4 h-4 text-emerald-400 shrink-0 mt-0.5"></i><span>Redundância real: se um cai, outro assume</span></li>
+          <li class="flex items-start gap-3 text-white text-sm font-medium"><i data-lucide="check-circle-2" class="w-4 h-4 text-emerald-400 shrink-0 mt-0.5"></i><span>API própria e exclusiva — 99,9% de uptime</span></li>
+          <li class="flex items-start gap-3 text-white text-sm font-medium"><i data-lucide="check-circle-2" class="w-4 h-4 text-emerald-400 shrink-0 mt-0.5"></i><span>Você continua vendendo enquanto outros travam</span></li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- Feature highlights -->
+    <div class="flex flex-col justify-center">
+      <div class="inline-flex w-fit items-center gap-2 rounded-full border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-indigo-300 font-semibold mb-6"><span class="h-1.5 w-1.5 rounded-full bg-indigo-400 animate-pulse"></span>DIFERENCIAL REAL</div>
+      <div class="space-y-3">
+        <div class="flex items-start gap-4 bg-[#0d1322] border border-white/10 rounded-2xl p-4 hover:border-indigo-500/30 transition-colors">
+          <div class="w-8 h-8 rounded-lg bg-indigo-500/15 ring-1 ring-indigo-500/20 flex items-center justify-center shrink-0 text-xs font-bold text-indigo-400 font-mono">01</div>
+          <div><p class="text-white font-semibold text-sm">Fallback automático</p><p class="text-neutral-500 text-xs mt-0.5">Número cai? Outro assume em segundos. Zero perdas.</p></div>
+        </div>
+        <div class="flex items-start gap-4 bg-[#0d1322] border border-white/10 rounded-2xl p-4 hover:border-indigo-500/30 transition-colors">
+          <div class="w-8 h-8 rounded-lg bg-indigo-500/15 ring-1 ring-indigo-500/20 flex items-center justify-center shrink-0 text-xs font-bold text-indigo-400 font-mono">02</div>
+          <div><p class="text-white font-semibold text-sm">Múltiplos números</p><p class="text-neutral-500 text-xs mt-0.5">Operação contínua mesmo com instabilidade.</p></div>
+        </div>
+        <div class="flex items-start gap-4 bg-[#0d1322] border border-white/10 rounded-2xl p-4 hover:border-indigo-500/30 transition-colors">
+          <div class="w-8 h-8 rounded-lg bg-indigo-500/15 ring-1 ring-indigo-500/20 flex items-center justify-center shrink-0 text-xs font-bold text-indigo-400 font-mono">03</div>
+          <div><p class="text-white font-semibold text-sm">API própria</p><p class="text-neutral-500 text-xs mt-0.5">Você não perde comissão por falha técnica.</p></div>
+        </div>
+      </div>
+      <div class="mt-6 p-4 rounded-2xl border border-emerald-500/15 bg-emerald-500/[0.04]">
+        <p class="text-emerald-300/80 text-sm font-medium">👉 você não perde comissão por falha técnica</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ VALUE ANCHOR ============ -->
+<section class="max-w-7xl mx-auto px-6 py-12 sm:py-20 relative z-10">
+  <div class="text-center mb-16">
+    <h2 class="text-3xl sm:text-4xl md:text-5xl text-white font-bricolage font-light tracking-tight mb-6">Quanto custa <span class="text-indigo-400">ficar manual?</span></h2>
+    <p class="text-neutral-400 text-lg max-w-lg mx-auto leading-relaxed">Veja o impacto direto da falta de automação na sua lucratividade.</p>
+  </div>
+
+  <div class="grid grid-cols-1 sm:grid-cols-3 gap-6 mb-12">
+    <div class="bg-[#0d1322] border border-violet-500/20 rounded-3xl p-6 sm:p-8 hover:border-violet-500/40 transition-colors">
+      <div class="flex items-center justify-between mb-6"><span class="text-[10px] uppercase tracking-widest font-bold px-3 py-1 rounded-full border border-violet-500/20 text-violet-400 bg-violet-500/10">Curto Prazo</span><i data-lucide="trending-down" class="w-5 h-5 text-violet-400"></i></div>
+      <p class="text-white font-semibold text-lg mb-6">1 dia sem postar</p>
+      <ul class="space-y-3 mb-8">
+        <li class="flex items-start gap-3 text-neutral-500 text-sm leading-tight"><span class="w-1.5 h-1.5 rounded-full shrink-0 mt-1.5 bg-violet-400"></span>Menos cliques nas ofertas</li>
+        <li class="flex items-start gap-3 text-neutral-500 text-sm leading-tight"><span class="w-1.5 h-1.5 rounded-full shrink-0 mt-1.5 bg-violet-400"></span>Vendas perdidas no dia</li>
+        <li class="flex items-start gap-3 text-neutral-500 text-sm leading-tight"><span class="w-1.5 h-1.5 rounded-full shrink-0 mt-1.5 bg-violet-400"></span>Dinheiro deixando de entrar</li>
+      </ul>
+      <div class="mb-4 h-1.5 bg-white/5 rounded-full overflow-hidden"><div class="h-full bg-violet-400 rounded-full" style="width:20%"></div></div>
+      <div class="flex items-center justify-between mt-6 pt-6 border-t border-white/5"><span class="text-neutral-600 text-xs font-medium uppercase tracking-wider">Comissão Perdida</span><span class="text-xl font-bold text-violet-400">~ R$ 50</span></div>
+    </div>
+    <div class="bg-[#0d1322] border border-indigo-500/20 rounded-3xl p-6 sm:p-8 hover:border-indigo-500/40 transition-colors">
+      <div class="flex items-center justify-between mb-6"><span class="text-[10px] uppercase tracking-widest font-bold px-3 py-1 rounded-full border border-indigo-500/20 text-indigo-400 bg-indigo-500/10">Médio Prazo</span><i data-lucide="trending-down" class="w-5 h-5 text-indigo-400"></i></div>
+      <p class="text-white font-semibold text-lg mb-6">1 semana inconsistente</p>
+      <ul class="space-y-3 mb-8">
+        <li class="flex items-start gap-3 text-neutral-500 text-sm leading-tight"><span class="w-1.5 h-1.5 rounded-full shrink-0 mt-1.5 bg-indigo-400"></span>Concorrentes dominando</li>
+        <li class="flex items-start gap-3 text-neutral-500 text-sm leading-tight"><span class="w-1.5 h-1.5 rounded-full shrink-0 mt-1.5 bg-indigo-400"></span>Grupos perdendo o engajamento</li>
+        <li class="flex items-start gap-3 text-neutral-500 text-sm leading-tight"><span class="w-1.5 h-1.5 rounded-full shrink-0 mt-1.5 bg-indigo-400"></span>Queda visível nas comissões</li>
+      </ul>
+      <div class="mb-4 h-1.5 bg-white/5 rounded-full overflow-hidden"><div class="h-full bg-indigo-400 rounded-full" style="width:55%"></div></div>
+      <div class="flex items-center justify-between mt-6 pt-6 border-t border-white/5"><span class="text-neutral-600 text-xs font-medium uppercase tracking-wider">Comissão Perdida</span><span class="text-xl font-bold text-indigo-400">~ R$ 350</span></div>
+    </div>
+    <div class="bg-[#0d1322] border border-red-500/20 rounded-3xl p-6 sm:p-8 hover:border-red-500/40 transition-colors">
+      <div class="flex items-center justify-between mb-6"><span class="text-[10px] uppercase tracking-widest font-bold px-3 py-1 rounded-full border border-red-500/20 text-red-400 bg-red-500/10">Longo Prazo</span><i data-lucide="trending-down" class="w-5 h-5 text-red-400"></i></div>
+      <p class="text-white font-semibold text-lg mb-6">Um mês no manual</p>
+      <ul class="space-y-3 mb-8">
+        <li class="flex items-start gap-3 text-neutral-500 text-sm leading-tight"><span class="w-1.5 h-1.5 rounded-full shrink-0 mt-1.5 bg-red-400"></span>Operação totalmente estagnada</li>
+        <li class="flex items-start gap-3 text-neutral-500 text-sm leading-tight"><span class="w-1.5 h-1.5 rounded-full shrink-0 mt-1.5 bg-red-400"></span>Centenas de vendas perdidas</li>
+        <li class="flex items-start gap-3 text-neutral-500 text-sm leading-tight"><span class="w-1.5 h-1.5 rounded-full shrink-0 mt-1.5 bg-red-400"></span>Você ficando para trás no mercado</li>
+      </ul>
+      <div class="mb-4 h-1.5 bg-white/5 rounded-full overflow-hidden"><div class="h-full bg-red-400 rounded-full" style="width:100%"></div></div>
+      <div class="flex items-center justify-between mt-6 pt-6 border-t border-white/5"><span class="text-neutral-600 text-xs font-medium uppercase tracking-wider">Comissão Perdida</span><span class="text-xl font-bold text-red-400">~ R$ 1.500+</span></div>
+    </div>
+  </div>
+
+  <div class="max-w-2xl mx-auto">
+    <div class="bg-red-500/[0.05] border border-red-500/20 rounded-[2rem] p-8 sm:p-10 text-center relative overflow-hidden group">
+      <div class="absolute top-0 right-0 p-6 opacity-10"><i data-lucide="alert-triangle" class="w-20 h-20 text-red-500"></i></div>
+      <p class="text-neutral-400 text-lg mb-4 relative z-10">Agora multiplique isso por 30 dias de operação...</p>
+      <div class="flex items-center justify-center gap-3 relative z-10"><i data-lucide="arrow-right" class="w-6 h-6 text-red-500"></i><p class="text-white font-bricolage font-light text-2xl sm:text-3xl uppercase tracking-tight">é isso que você está perdendo</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ FEATURES (02.) ============ -->
+<section id="funcionalidades" class="[animation:animationIn_0.8s_ease-out_0.1s_both] animate-on-scroll bg-gradient-to-tr from-white/0 via-white/[0.04] to-white/0 max-w-7xl rounded-3xl mt-8 sm:mt-12 mb-8 sm:mb-12 mx-2.5 lg:mx-auto p-6 sm:p-10 relative z-10" style="--border-gradient: linear-gradient(45deg, rgba(255,255,255,0), rgba(255,255,255,0.1), rgba(255,255,255,0)); --border-radius-before: 24px">
+  <div class="flex flex-col lg:flex-row gap-4 mb-12 items-start lg:items-center">
+    <span class="text-6xl sm:text-7xl lg:text-8xl text-white/5 font-bricolage font-light tracking-tight">02.</span>
+    <div class="space-y-2">
+      <h2 class="text-3xl md:text-5xl text-white font-bricolage font-light tracking-tight">Você entra no automático <span class="text-indigo-400">em minutos.</span></h2>
+    </div>
+  </div>
+
+  <div class="space-y-10 lg:space-y-16">
+    <!-- Step 1 -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 lg:gap-16 items-stretch">
+      <div class="rounded-3xl bg-[#0d1322] border border-white/10 p-8 min-h-64 flex items-center justify-center">
+        <div class="w-full h-full flex flex-col items-center justify-center gap-4">
+          <div class="w-32 h-32 bg-white/10 rounded-lg border border-white/10 grid grid-cols-5 gap-0.5 p-2" id="qr-grid"></div>
+          <div class="flex items-center gap-2"><span class="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span><span class="text-xs text-emerald-300 font-medium">Conectado</span></div>
+        </div>
+      </div>
+      <div class="flex flex-col justify-center">
+        <span class="inline-flex items-center w-fit px-3.5 py-1 rounded-full border border-indigo-500/30 bg-indigo-500/10 text-xs text-indigo-300 font-medium mb-6">PASSO 1</span>
+        <h3 class="text-2xl sm:text-3xl text-white font-bricolage font-light tracking-tight mb-4">Conecta via QR</h3>
+        <p class="text-base text-neutral-400 leading-relaxed">Conecte seus números WhatsApp via QR Code em segundos. Sem configuração técnica, sem complicação. Só escanear e pronto.</p>
+      </div>
+    </div>
+    <!-- Step 2 -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 lg:gap-16 items-stretch">
+      <div class="lg:order-2 rounded-3xl bg-[#0d1322] border border-white/10 p-8 min-h-64 flex items-center justify-center">
+        <div class="w-full grid grid-cols-2 gap-3">
+          <div class="border border-indigo-400/40 bg-indigo-400/10 rounded-xl p-3 text-center flex flex-col items-center"><i data-lucide="shopping-bag" class="w-5 h-5 text-indigo-400 mb-1"></i><p class="text-xs text-white font-medium">Shopee</p><p class="text-xs text-neutral-400 mt-1">34 grupos</p></div>
+          <div class="border border-violet-400/40 bg-violet-400/10 rounded-xl p-3 text-center flex flex-col items-center"><i data-lucide="box" class="w-5 h-5 text-violet-400 mb-1"></i><p class="text-xs text-white font-medium">Amazon</p><p class="text-xs text-neutral-400 mt-1">28 grupos</p></div>
+          <div class="border border-indigo-400/40 bg-indigo-400/10 rounded-xl p-3 text-center flex flex-col items-center"><i data-lucide="smartphone" class="w-5 h-5 text-indigo-400 mb-1"></i><p class="text-xs text-white font-medium">Mercado Livre</p><p class="text-xs text-neutral-400 mt-1">19 grupos</p></div>
+          <div class="border border-violet-400/40 bg-violet-400/10 rounded-xl p-3 text-center flex flex-col items-center"><i data-lucide="sparkles" class="w-5 h-5 text-violet-400 mb-1"></i><p class="text-xs text-white font-medium">Outros</p><p class="text-xs text-neutral-400 mt-1">+12 grupos</p></div>
+        </div>
+      </div>
+      <div class="lg:order-1 flex flex-col justify-center">
+        <span class="inline-flex items-center w-fit px-3.5 py-1 rounded-full border border-indigo-500/30 bg-indigo-500/10 text-xs text-indigo-300 font-medium mb-6">PASSO 2</span>
+        <h3 class="text-2xl sm:text-3xl text-white font-bricolage font-light tracking-tight mb-4">Organiza grupos</h3>
+        <p class="text-base text-neutral-400 leading-relaxed">Sincronize e organize seus grupos por segmentos em segundos. O sistema distribui automaticamente entre os números. Zero trabalho manual.</p>
+      </div>
+    </div>
+    <!-- Step 3 -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 lg:gap-16 items-stretch">
+      <div class="rounded-3xl bg-[#0d1322] border border-white/10 p-8 min-h-64 flex items-center justify-center">
+        <div class="w-full flex flex-col gap-4">
+          <div class="bg-neutral-950/60 border border-white/10 rounded-lg p-3.5"><p class="text-[9px] text-neutral-500 font-mono uppercase tracking-widest mb-2 opacity-70">Original</p><p class="text-sm text-neutral-300">iPhone em promoção, clica no link.</p></div>
+          <div class="flex justify-center"><div class="bg-indigo-600/20 ring-1 ring-indigo-500/30 p-2 rounded-full"><i data-lucide="wand-2" class="w-3.5 h-3.5 text-indigo-300 animate-pulse"></i></div></div>
+          <div class="bg-indigo-950/40 border border-indigo-500/30 rounded-lg p-3.5"><p class="text-[9px] text-indigo-300 font-mono uppercase tracking-widest mb-2">IA Persuasivo</p><p class="text-sm text-white font-medium leading-relaxed">ACHADO DO DIA! iPhone com desconto incrível. Estoque limitado!</p></div>
+        </div>
+      </div>
+      <div class="flex flex-col justify-center">
+        <span class="inline-flex items-center w-fit px-3.5 py-1 rounded-full border border-indigo-500/30 bg-indigo-500/10 text-xs text-indigo-300 font-medium mb-6">PASSO 3</span>
+        <h3 class="text-2xl sm:text-3xl text-white font-bricolage font-light tracking-tight mb-4">Ativa a IA</h3>
+        <p class="text-base text-neutral-400 leading-relaxed">A IA entra em ação: monitora, reescreve suas ofertas em 9 estilos diferentes e aumenta cliques em até 40%. Você só liga o sistema.</p>
+      </div>
+    </div>
+    <!-- Step 4 -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 lg:gap-16 items-stretch">
+      <div class="lg:order-2 rounded-3xl bg-[#0d1322] border border-white/10 p-8 min-h-64 flex items-center justify-center">
+        <div class="w-full flex flex-col gap-5">
+          <div class="flex items-center justify-between"><div class="flex items-center gap-2"><div class="w-6 h-6 bg-indigo-500/20 rounded-md flex items-center justify-center"><i data-lucide="bar-chart-3" class="w-3 h-3 text-indigo-400"></i></div><span class="text-xs font-medium text-white">Em Andamento</span></div><span class="w-2.5 h-2.5 bg-emerald-400 rounded-full animate-pulse"></span></div>
+          <div class="space-y-3">
+            <div class="flex items-center gap-2.5"><div class="flex-1"><div class="h-1.5 bg-white/5 rounded-full overflow-hidden"><div class="h-full bg-gradient-to-r from-indigo-500 to-indigo-400" style="width:80%"></div></div></div><div class="text-right min-w-fit"><p class="text-[10px] text-neutral-400">Grupos</p><p class="text-xs text-white font-semibold">2.4K</p></div></div>
+            <div class="flex items-center gap-2.5"><div class="flex-1"><div class="h-1.5 bg-white/5 rounded-full overflow-hidden"><div class="h-full bg-gradient-to-r from-emerald-500 to-emerald-400" style="width:98%"></div></div></div><div class="text-right min-w-fit"><p class="text-[10px] text-neutral-400">Entregues</p><p class="text-xs text-white font-semibold">98%</p></div></div>
+            <div class="flex items-center gap-2.5"><div class="flex-1"><div class="h-1.5 bg-white/5 rounded-full overflow-hidden"><div class="h-full bg-gradient-to-r from-violet-500 to-violet-400" style="width:60%"></div></div></div><div class="text-right min-w-fit"><p class="text-[10px] text-neutral-400">Cliques</p><p class="text-xs text-white font-semibold">+40%</p></div></div>
+          </div>
+          <div class="flex items-end gap-1.5 h-12" id="bars-chart"></div>
+        </div>
+      </div>
+      <div class="lg:order-1 flex flex-col justify-center">
+        <span class="inline-flex items-center w-fit px-3.5 py-1 rounded-full border border-indigo-500/30 bg-indigo-500/10 text-xs text-indigo-300 font-medium mb-6">PASSO 4</span>
+        <h3 class="text-2xl sm:text-3xl text-white font-bricolage font-light tracking-tight mb-4">Começa a rodar</h3>
+        <p class="text-base text-neutral-400 leading-relaxed">O sistema dispara automaticamente para todos os seus grupos, monitora entregas e você acompanha tudo em tempo real. 24h por dia.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ OBJECTIONS ============ -->
+<section class="max-w-7xl mx-auto px-6 py-12 sm:py-20 relative z-10">
+  <div class="text-center mb-10">
+    <h2 class="text-2xl sm:text-3xl md:text-4xl text-white font-bricolage font-light tracking-tight mb-3">Antes de decidir — <span class="text-indigo-400">vamos direto ao ponto</span></h2>
+    <p class="text-neutral-500 text-sm max-w-sm mx-auto leading-relaxed">As dúvidas mais comuns, respondidas sem enrolação.</p>
+  </div>
+  <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
+    <div class="bg-[#0d1322] border border-white/10 rounded-2xl p-7 hover:border-indigo-500/30 transition-colors">
+      <div class="w-11 h-11 rounded-xl ring-1 ring-indigo-500/20 bg-indigo-500/10 flex items-center justify-center mb-5"><i data-lucide="help-circle" class="w-5 h-5 text-indigo-400"></i></div>
+      <p class="text-neutral-500 text-sm font-medium mb-3 italic">"Não sei usar"</p>
+      <div class="flex items-start gap-2 mb-4"><i data-lucide="check-circle-2" class="w-4 h-4 text-emerald-400 shrink-0 mt-0.5"></i><p class="text-white font-semibold text-sm leading-snug">foi feito pra quem não sabe</p></div>
+      <p class="text-neutral-500 text-xs leading-relaxed border-t border-white/5 pt-4">Interface simples, suporte humano real e acesso remoto para te ensinar. Você não precisa saber tecnologia.</p>
+    </div>
+    <div class="bg-[#0d1322] border border-white/10 rounded-2xl p-7 hover:border-indigo-500/30 transition-colors">
+      <div class="w-11 h-11 rounded-xl ring-1 ring-indigo-500/20 bg-indigo-500/10 flex items-center justify-center mb-5"><i data-lucide="trending-up" class="w-5 h-5 text-indigo-400"></i></div>
+      <p class="text-neutral-500 text-sm font-medium mb-3 italic">"Tenho poucos grupos"</p>
+      <div class="flex items-start gap-2 mb-4"><i data-lucide="check-circle-2" class="w-4 h-4 text-emerald-400 shrink-0 mt-0.5"></i><p class="text-white font-semibold text-sm leading-snug">perfeito, você cresce com ele</p></div>
+      <p class="text-neutral-500 text-xs leading-relaxed border-t border-white/5 pt-4">Começa pequeno, escala sem troca de plano. O sistema distribui automaticamente conforme você adiciona grupos.</p>
+    </div>
+    <div class="bg-[#0d1322] border border-white/10 rounded-2xl p-7 hover:border-indigo-500/30 transition-colors">
+      <div class="w-11 h-11 rounded-xl ring-1 ring-indigo-500/20 bg-indigo-500/10 flex items-center justify-center mb-5"><i data-lucide="settings" class="w-5 h-5 text-indigo-400"></i></div>
+      <p class="text-neutral-500 text-sm font-medium mb-3 italic">"Já tentei bot"</p>
+      <div class="flex items-start gap-2 mb-4"><i data-lucide="check-circle-2" class="w-4 h-4 text-emerald-400 shrink-0 mt-0.5"></i><p class="text-white font-semibold text-sm leading-snug">o problema não era automação</p></div>
+      <p class="text-neutral-500 text-xs leading-relaxed border-t border-white/5 pt-4">Era a ferramenta errada. API própria, fallback automático e múltiplos números fazem toda a diferença na prática.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ TESTIMONIALS ============ -->
+<section class="max-w-7xl mx-auto px-6 py-12 sm:py-20 relative z-10">
+  <div class="flex flex-col md:flex-row md:items-end md:justify-between gap-4 mb-10">
+    <h2 class="text-3xl md:text-5xl text-white font-bricolage font-light tracking-tight max-w-lg">Afiliados Que <span class="text-indigo-400">Escalaram</span> Com OrbitSender</h2>
+    <p class="text-neutral-400 max-w-xs md:text-right text-sm leading-relaxed">Histórias reais de quem aumentou vendas e cliques com <span class="text-white font-medium">entrega garantida</span>.</p>
+  </div>
+
+  <div class="bg-[#0d1322] border border-white/10 rounded-3xl p-8 md:p-14 relative overflow-hidden">
+    <div class="absolute top-0 right-0 w-64 h-64 bg-indigo-500/5 blur-[80px] rounded-full pointer-events-none"></div>
+    <div class="flex items-center gap-1 mb-6 relative z-10">
+      <i data-lucide="star" class="w-3.5 h-3.5 fill-violet-400 text-violet-400"></i>
+      <i data-lucide="star" class="w-3.5 h-3.5 fill-violet-400 text-violet-400"></i>
+      <i data-lucide="star" class="w-3.5 h-3.5 fill-violet-400 text-violet-400"></i>
+      <i data-lucide="star" class="w-3.5 h-3.5 fill-violet-400 text-violet-400"></i>
+      <i data-lucide="star" class="w-3.5 h-3.5 fill-violet-400 text-violet-400"></i>
+      <span class="text-neutral-500 text-xs ml-2">4.9 · avaliações verificadas</span>
+    </div>
+    <blockquote id="t-quote" class="text-xl sm:text-2xl md:text-3xl font-bricolage font-light tracking-tight text-white leading-snug mb-8 max-w-3xl relative z-10">"Trabalho com 50+ grupos. Antes perdia ofertas por instabilidade. Agora com entrega garantida e múltiplos números, minhas vendas triplicaram."</blockquote>
+    <div id="t-metric" class="inline-flex items-center gap-2 bg-gradient-to-r from-indigo-500 to-violet-500 text-white rounded-full px-4 py-1.5 text-xs font-bold tracking-wide mb-10 relative z-10">+300% de vendas</div>
+
+    <div class="flex flex-col sm:flex-row sm:items-center gap-6 pt-6 border-t border-white/10 relative z-10">
+      <div class="flex items-center gap-3 flex-1">
+        <img id="t-img" src="https://picsum.photos/100/100?random=1" alt="Avatar" class="w-11 h-11 rounded-full border border-white/10 object-cover" loading="lazy" />
+        <div><p id="t-name" class="text-white font-semibold text-sm">João Silva</p><p id="t-role" class="text-neutral-500 text-xs">Afiliado · 50+ grupos</p></div>
+      </div>
+      <div class="flex items-center gap-2" id="t-thumbs"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ PRICING (03.) ============ -->
+<section id="precos" class="py-20 bg-[#0B1120]" aria-labelledby="pricing-heading"><div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8"><div class="text-center mb-16 scroll-reveal revealed"><div class="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-gradient-to-r from-red-500/20 to-orange-500/20 border border-red-500/40 text-red-300 text-sm font-bold mb-4 animate-pulse"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-flame" aria-hidden="true"><path d="M12 3q1 4 4 6.5t3 5.5a1 1 0 0 1-14 0 5 5 0 0 1 1-3 1 1 0 0 0 5 0c0-2-1.5-3-1.5-5q0-2 2.5-4"></path></svg>PROMOÇÃO POR TEMPO LIMITADO<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-flame" aria-hidden="true"><path d="M12 3q1 4 4 6.5t3 5.5a1 1 0 0 1-14 0 5 5 0 0 1 1-3 1 1 0 0 0 5 0c0-2-1.5-3-1.5-5q0-2 2.5-4"></path></svg></div><h2 id="pricing-heading" class="text-3xl md:text-5xl font-bold mb-4">Vamos <span class="gradient-text-static">Crescer</span> Juntos</h2><p class="text-slate-400 max-w-2xl mx-auto">Escolha o plano ideal para escalar seus grupos de achadinhos, e turbine seus envios com nossas funcionalidades.</p></div><div class="grid grid-cols-1 lg:grid-cols-3 gap-6 xl:gap-8 items-stretch"><div class="relative scroll-reveal-scale revealed"><div class="relative p-8 lg:p-7 xl:p-8 rounded-2xl border-2 bg-slate-800/80 shadow-2xl transition-all duration-500 hover:scale-[1.02] group h-full flex flex-col  border-cyan-500/30 shadow-cyan-500/10 hover:border-cyan-400/60 hover:shadow-cyan-500/20"><div class="flex items-center justify-center gap-2 mb-4 lg:mb-3"><div class="text-cyan-400 transition-colors duration-300"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-rocket w-5 h-5" aria-hidden="true"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"></path><path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"></path><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0"></path><path d="M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"></path></svg></div><span class="text-lg font-semibold text-slate-200 tracking-wide uppercase">COMETA</span></div><div class="flex flex-col items-center gap-1 mb-4 lg:mb-3"><div class="flex items-center gap-2"><span class="text-sm text-slate-400 line-through">R$ 129.90/mês</span></div><div class="flex items-baseline justify-center gap-1"><span class="text-sm text-slate-400">R$</span><span class="text-5xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-blue-400 group-hover:from-cyan-300 group-hover:to-blue-300 transition-all duration-300">97</span><span class="text-2xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-blue-400 group-hover:from-cyan-300 group-hover:to-blue-300 transition-all duration-300">,90</span><span class="text-slate-400 text-xl">/mês</span></div><span class="text-xs text-emerald-400 font-medium mt-1">🔥 Economize R$ 32,00/mês</span></div><p class="text-center text-sm italic text-slate-300 font-medium mb-6 px-2 leading-relaxed">Ideal para validar sua operação e começar os primeiros envios.</p><ul class="space-y-3 lg:space-y-2.5 mb-6 lg:mb-5"><li class="scroll-reveal-left revealed" style="animation-delay: 0s;"><div class="flex items-start gap-2.5 rounded-xl border px-3 py-2.5 border-cyan-400/40 bg-cyan-500/10 ring-1 ring-cyan-400/20 shadow-[0_0_24px_-8px_rgba(34,211,238,0.6)]"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-sparkles w-5 h-5 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110 text-cyan-300" aria-hidden="true"><path d="M11.017 2.814a1 1 0 0 1 1.966 0l1.051 5.558a2 2 0 0 0 1.594 1.594l5.558 1.051a1 1 0 0 1 0 1.966l-5.558 1.051a2 2 0 0 0-1.594 1.594l-1.051 5.558a1 1 0 0 1-1.966 0l-1.051-5.558a2 2 0 0 0-1.594-1.594l-5.558-1.051a1 1 0 0 1 0-1.966l5.558-1.051a2 2 0 0 0 1.594-1.594z"></path><path d="M20 2v4"></path><path d="M22 4h-4"></path><circle cx="4" cy="20" r="2"></circle></svg><span class="leading-snug text-sm md:text-base"><span class="font-bold text-white">Grupo de Suporte Individual Exclusivo</span><span class="block text-xs md:text-sm mt-0.5 text-cyan-200/80">onde você pode adicionar sua equipe</span></span></div></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.04s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="font-semibold text-slate-100 leading-snug">Envios de Ofertas Ilimitados</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.08s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="font-semibold text-slate-100 leading-snug">Gerencie até 10 Grupos</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.12s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="font-semibold text-slate-100 leading-snug">1 Número de Envio no WhatsApp</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.16s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="font-semibold text-slate-100 leading-snug">1 Segmento (Bloco de envio)</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.2s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="text-slate-400 leading-snug"><span class="font-semibold text-white">Fila Agendada:</span> Programe suas ofertas para o dia todo</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.24s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="text-slate-400 leading-snug"><span class="font-semibold text-white">Replique Grupos:</span> Copie publicações de outros grupos de terceiros</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.28s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="text-slate-400 leading-snug"><span class="font-semibold text-white">Entrega Robusta:</span> Garantimos a entrega para todos os membros do grupo</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.32s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="text-slate-400 leading-snug"><span class="font-semibold text-white">Proteção Anti-Ban:</span> Tecnologia de segurança integrada</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.36s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="font-semibold text-slate-100 leading-snug">IA para Gerar Promoções</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.4s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="font-semibold text-slate-100 leading-snug">Link Preview e Carrossel de Ofertas</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.44s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="text-slate-400 leading-snug"><span class="font-semibold text-white">Integração:</span> Shopee, Amazon, ML e Magalu</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.48s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="text-slate-400 leading-snug"><span class="font-semibold text-white">Encurtador de Link:</span> Link personalizado para cada grupo, reduzindo a chance de banimento nos grupos</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.52s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="font-semibold text-slate-100 leading-snug">Estrutura dedicada para cada número conectado</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.56s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="font-semibold text-slate-100 leading-snug">Proteção de números por Proxy</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left opacity-50 revealed" style="animation-delay: 0.6s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-x w-5 h-5 text-slate-600 shrink-0 mt-0.5" aria-hidden="true"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg><span class="line-through text-slate-500">Canais Adicionais (Proxy + IP Dedicado)</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left opacity-50 revealed" style="animation-delay: 0.64s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-x w-5 h-5 text-slate-600 shrink-0 mt-0.5" aria-hidden="true"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg><span class="line-through text-slate-500">Acesso para Equipe / Gestão de Membros</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left opacity-50 revealed" style="animation-delay: 0.68s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-x w-5 h-5 text-slate-600 shrink-0 mt-0.5" aria-hidden="true"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg><span class="line-through text-slate-500">MultSender PRO (Cadastro em massa)</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left opacity-50 revealed" style="animation-delay: 0.72s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-x w-5 h-5 text-slate-600 shrink-0 mt-0.5" aria-hidden="true"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg><span class="line-through text-slate-500">Infraestrutura Premium Isolada</span></li></ul><a href="https://pay.kiwify.com.br/ZhQszc7" class="w-full py-4 rounded-xl font-bold block text-center text-white shadow-lg hover:shadow-xl hover:-translate-y-1 transition-all duration-300 mt-auto bg-gradient-to-r from-cyan-600 to-blue-500 hover:from-cyan-500 hover:to-blue-400 hover:shadow-cyan-600/40">🔥 Aproveitar Promoção</a><div class="mt-5 pt-5 border-t border-slate-700/60 text-center"><p class="text-xs text-slate-400 leading-relaxed">Precisa de mais números? A partir do plano <span class="text-violet-300 font-semibold">Lunar</span> você pode adquirir mais canais.</p></div></div></div><div class="relative scroll-reveal-scale revealed"><div class="absolute -top-4 left-1/2 -translate-x-1/2 z-10"><div class="inline-flex items-center gap-1.5 px-5 py-1.5 rounded-full text-white text-sm font-extrabold shadow-lg animate-bounce bg-gradient-to-r from-violet-600 to-fuchsia-500 shadow-violet-500/40"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-sparkles" aria-hidden="true"><path d="M11.017 2.814a1 1 0 0 1 1.966 0l1.051 5.558a2 2 0 0 0 1.594 1.594l5.558 1.051a1 1 0 0 1 0 1.966l-5.558 1.051a2 2 0 0 0-1.594 1.594l-1.051 5.558a1 1 0 0 1-1.966 0l-1.051-5.558a2 2 0 0 0-1.594-1.594l-5.558-1.051a1 1 0 0 1 0-1.966l5.558-1.051a2 2 0 0 0 1.594-1.594z"></path><path d="M20 2v4"></path><path d="M22 4h-4"></path><circle cx="4" cy="20" r="2"></circle></svg>MAIS POPULAR</div></div><div class="relative p-8 lg:p-7 xl:p-8 rounded-2xl border-2 bg-slate-800/80 shadow-2xl transition-all duration-500 hover:scale-[1.02] group h-full flex flex-col pt-10 lg:pt-8 border-violet-500/50 shadow-violet-500/20 hover:border-violet-400/70 hover:shadow-violet-500/40"><div class="flex items-center justify-center gap-2 mb-4 lg:mb-3"><div class="text-violet-400 transition-colors duration-300"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-moon w-5 h-5" aria-hidden="true"><path d="M20.985 12.486a9 9 0 1 1-9.473-9.472c.405-.022.617.46.402.803a6 6 0 0 0 8.268 8.268c.344-.215.825-.004.803.401"></path></svg></div><span class="text-lg font-semibold text-slate-200 tracking-wide uppercase">LUNAR</span></div><div class="flex flex-col items-center gap-1 mb-4 lg:mb-3"><div class="flex items-center gap-2"><span class="text-sm text-slate-400 line-through">R$ 229.90/mês</span></div><div class="flex items-baseline justify-center gap-1"><span class="text-sm text-slate-400">R$</span><span class="text-5xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-violet-400 via-fuchsia-400 to-pink-400 group-hover:from-violet-300 group-hover:to-pink-300 transition-all duration-300">179</span><span class="text-2xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-violet-400 via-fuchsia-400 to-pink-400 group-hover:from-violet-300 group-hover:to-pink-300 transition-all duration-300">,90</span><span class="text-slate-400 text-xl">/mês</span></div><span class="text-xs text-emerald-400 font-medium mt-1">🔥 Economize R$ 32,00/mês</span></div><p class="text-center text-sm italic text-slate-300 font-medium mb-6 px-2 leading-relaxed">Focado em crescimento e expansão da operação.</p><ul class="space-y-3 lg:space-y-2.5 mb-6 lg:mb-5"><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.15s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-arrow-right w-5 h-5 text-violet-400 shrink-0 mt-0.5" aria-hidden="true"><path d="M5 12h14"></path><path d="m12 5 7 7-7 7"></path></svg><span class="font-bold text-transparent bg-clip-text bg-gradient-to-r from-violet-400 to-fuchsia-400 text-sm uppercase tracking-wide">TUDO DO PLANO COMETA E...</span></li><li class="scroll-reveal-left revealed" style="animation-delay: 0.19s;"><div class="flex items-start gap-2.5 rounded-xl border px-3 py-2.5 border-violet-400/40 bg-violet-500/10 ring-1 ring-violet-400/20 shadow-[0_0_24px_-8px_rgba(167,139,250,0.6)]"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-sparkles w-5 h-5 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110 text-violet-300" aria-hidden="true"><path d="M11.017 2.814a1 1 0 0 1 1.966 0l1.051 5.558a2 2 0 0 0 1.594 1.594l5.558 1.051a1 1 0 0 1 0 1.966l-5.558 1.051a2 2 0 0 0-1.594 1.594l-1.051 5.558a1 1 0 0 1-1.966 0l-1.051-5.558a2 2 0 0 0-1.594-1.594l-5.558-1.051a1 1 0 0 1 0-1.966l5.558-1.051a2 2 0 0 0 1.594-1.594z"></path><path d="M20 2v4"></path><path d="M22 4h-4"></path><circle cx="4" cy="20" r="2"></circle></svg><span class="leading-snug text-sm md:text-base"><span class="font-bold text-white">Grupo de Suporte Individual Exclusivo</span><span class="block text-xs md:text-sm mt-0.5 text-violet-200/80">onde você pode adicionar sua equipe</span></span></div></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.23s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="font-semibold text-slate-100 leading-snug">Gerencie até 50 Grupos</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.27s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="font-semibold text-slate-100 leading-snug">2 Números de Envio no WhatsApp</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.31s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="font-semibold text-slate-100 leading-snug">2 Segmentos (Bloco de envio)</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.35s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="text-slate-400 leading-snug"><span class="font-semibold text-white">Escala de Conexões:</span> Adicione números com Proxy + IP dedicado contra banimentos</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.39s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="text-slate-400 leading-snug"><span class="font-semibold text-white">QuickSender:</span> Sistema de envio ultra rápido</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.43s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="text-slate-400 leading-snug"><span class="font-semibold text-white">Disparo Simultâneo:</span> Várias filas rodando ao mesmo tempo</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.47s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="text-slate-400 leading-snug"><span class="font-semibold text-white">IA Optimizer:</span> +40% de Cliques</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.51s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="text-slate-400 leading-snug"><span class="font-semibold text-white">Rodízio de IPs Residenciais Dedicados:</span> Maior segurança simulando residências no Brasil</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.55s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="text-slate-400 leading-snug"><span class="font-semibold text-white">Encurtador + Comissões:</span> Saiba quanto cada grupo rendeu de comissão</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.59s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="text-slate-400 leading-snug"><span class="font-semibold text-white">Comissões Shopee:</span> Veja suas comissões assim que o relatório de vendas é liberado</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.63s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="text-slate-400 leading-snug"><span class="font-semibold text-white">Métricas por Região:</span> cliques e visualizações por estado e cidade</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left opacity-50 revealed" style="animation-delay: 0.67s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-x w-5 h-5 text-slate-600 shrink-0 mt-0.5" aria-hidden="true"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg><span class="line-through text-slate-500">Acesso para Equipe / Gestão de Membros</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left opacity-50 revealed" style="animation-delay: 0.71s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-x w-5 h-5 text-slate-600 shrink-0 mt-0.5" aria-hidden="true"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg><span class="line-through text-slate-500">MultSender PRO (Cadastro em massa)</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left opacity-50 revealed" style="animation-delay: 0.75s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-x w-5 h-5 text-slate-600 shrink-0 mt-0.5" aria-hidden="true"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg><span class="line-through text-slate-500">Infraestrutura Premium Isolada</span></li></ul><a href="https://pay.kiwify.com.br/qm2v6Xo" class="w-full py-4 rounded-xl font-bold block text-center text-white shadow-lg hover:shadow-xl hover:-translate-y-1 transition-all duration-300 mt-auto bg-gradient-to-r from-violet-600 to-fuchsia-500 hover:from-violet-500 hover:to-fuchsia-400 hover:shadow-violet-600/40">🔥 Aproveitar Promoção</a><div class="mt-5 pt-5 border-t border-slate-700/60 text-center"><p class="text-xs text-slate-400 mb-1.5">Precisa de mais números? Adicione canais conforme cresce:</p><p class="text-sm text-slate-300">R$ <span class="text-transparent bg-clip-text bg-gradient-to-r from-red-400 to-orange-400 font-bold">97,00</span>/mês por canal adicional</p><p class="text-xs text-slate-500 mt-1 leading-relaxed">Inclui IP dedicado e rodízio para máxima segurança contra banimentos · Disponível a partir do plano Lunar</p></div></div></div><div class="relative scroll-reveal-scale revealed"><div class="absolute -top-4 left-1/2 -translate-x-1/2 z-10"><div class="inline-flex items-center gap-1.5 px-5 py-1.5 rounded-full text-white text-sm font-extrabold shadow-lg animate-bounce bg-gradient-to-r from-red-600 to-orange-500 shadow-red-500/40"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-tag" aria-hidden="true"><path d="M12.586 2.586A2 2 0 0 0 11.172 2H4a2 2 0 0 0-2 2v7.172a2 2 0 0 0 .586 1.414l8.704 8.704a2.426 2.426 0 0 0 3.42 0l6.58-6.58a2.426 2.426 0 0 0 0-3.42z"></path><circle cx="7.5" cy="7.5" r=".5" fill="currentColor"></circle></svg>OFERTA ESPECIAL</div></div><div class="relative p-8 lg:p-7 xl:p-8 rounded-2xl border-2 bg-slate-800/80 shadow-2xl transition-all duration-500 hover:scale-[1.02] group h-full flex flex-col pt-10 lg:pt-8 border-red-500/50 shadow-red-500/20 hover:border-red-400/70 hover:shadow-red-500/40"><div class="flex items-center justify-center gap-2 mb-4 lg:mb-3"><div class="text-red-400 transition-colors duration-300"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-sparkles w-5 h-5" aria-hidden="true"><path d="M11.017 2.814a1 1 0 0 1 1.966 0l1.051 5.558a2 2 0 0 0 1.594 1.594l5.558 1.051a1 1 0 0 1 0 1.966l-5.558 1.051a2 2 0 0 0-1.594 1.594l-1.051 5.558a1 1 0 0 1-1.966 0l-1.051-5.558a2 2 0 0 0-1.594-1.594l-5.558-1.051a1 1 0 0 1 0-1.966l5.558-1.051a2 2 0 0 0 1.594-1.594z"></path><path d="M20 2v4"></path><path d="M22 4h-4"></path><circle cx="4" cy="20" r="2"></circle></svg></div><span class="text-lg font-semibold text-slate-200 tracking-wide uppercase">NOVA</span></div><div class="flex flex-col items-center gap-1 mb-4 lg:mb-3"><div class="flex items-center gap-2"><span class="text-sm text-slate-400 line-through">R$ 497.00/mês</span></div><div class="flex items-baseline justify-center gap-1"><span class="text-sm text-slate-400">R$</span><span class="text-5xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-red-400 via-orange-400 to-amber-400 group-hover:from-red-300 group-hover:to-amber-300 transition-all duration-300">399</span><span class="text-2xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-red-400 via-orange-400 to-amber-400 group-hover:from-red-300 group-hover:to-amber-300 transition-all duration-300">,90</span><span class="text-slate-400 text-xl">/mês</span></div><span class="text-xs text-emerald-400 font-medium mt-1">🔥 Economize R$ 100,00/mês</span></div><p class="text-center text-sm italic text-slate-300 font-medium mb-6 px-2 leading-relaxed">A potência máxima: Gestão de equipe e automação industrial.</p><ul class="space-y-3 lg:space-y-2.5 mb-6 lg:mb-5"><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.3s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-arrow-right w-5 h-5 text-violet-400 shrink-0 mt-0.5" aria-hidden="true"><path d="M5 12h14"></path><path d="m12 5 7 7-7 7"></path></svg><span class="font-bold text-transparent bg-clip-text bg-gradient-to-r from-violet-400 to-fuchsia-400 text-sm uppercase tracking-wide">TUDO DO PLANO LUNAR E...</span></li><li class="scroll-reveal-left revealed" style="animation-delay: 0.34s;"><div class="flex items-start gap-2.5 rounded-xl border px-3 py-2.5 border-red-400/40 bg-red-500/10 ring-1 ring-red-400/20 shadow-[0_0_24px_-8px_rgba(248,113,113,0.6)]"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-sparkles w-5 h-5 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110 text-red-300" aria-hidden="true"><path d="M11.017 2.814a1 1 0 0 1 1.966 0l1.051 5.558a2 2 0 0 0 1.594 1.594l5.558 1.051a1 1 0 0 1 0 1.966l-5.558 1.051a2 2 0 0 0-1.594 1.594l-1.051 5.558a1 1 0 0 1-1.966 0l-1.051-5.558a2 2 0 0 0-1.594-1.594l-5.558-1.051a1 1 0 0 1 0-1.966l5.558-1.051a2 2 0 0 0 1.594-1.594z"></path><path d="M20 2v4"></path><path d="M22 4h-4"></path><circle cx="4" cy="20" r="2"></circle></svg><span class="leading-snug text-sm md:text-base"><span class="font-bold text-white">Grupo de Suporte Individual Exclusivo</span><span class="block text-xs md:text-sm mt-0.5 text-red-200/80">onde você pode adicionar sua equipe</span></span></div></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.38s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="font-semibold text-slate-100 leading-snug">Grupos ILIMITADOS</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.42s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="font-semibold text-slate-100 leading-snug">5 Números de Envio no WhatsApp</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.46s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="font-semibold text-slate-100 leading-snug">Segmentos ILIMITADOS</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.5s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="text-slate-400 leading-snug"><span class="font-semibold text-white">Gestão de Equipe:</span> Acesso multi-membros para gerenciar sua operação</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.54s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="text-slate-400 leading-snug"><span class="font-semibold text-white">Escala de Conexões Ilimitada:</span> Contrate quantos números sua operação exigir</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.58s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="text-slate-400 leading-snug"><span class="font-semibold text-white">Infraestrutura Premium Isolada:</span> Máxima performance e estabilidade</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.62s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="text-slate-400 leading-snug"><span class="font-semibold text-white">MultSender PRO:</span> Cole 50 links e transforme em 50 campanhas instantaneamente</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.66s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="font-semibold text-slate-100 leading-snug">API e Webhook para Integrações Externas</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.7s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="text-slate-400 leading-snug"><span class="font-semibold text-white">Métricas Avançadas:</span> Relatórios de performance de alto nível</span></li><li class="flex items-start gap-3 text-sm md:text-base scroll-reveal-left text-slate-300 revealed" style="animation-delay: 0.74s;"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-0.5 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg><span class="font-semibold text-slate-100 leading-snug">Suporte via WhatsApp Prioritário</span></li></ul><a href="https://pay.kiwify.com.br/vJ58Rtj" class="w-full py-4 rounded-xl font-bold block text-center text-white shadow-lg hover:shadow-xl hover:-translate-y-1 transition-all duration-300 mt-auto bg-gradient-to-r from-red-600 to-orange-500 hover:from-red-500 hover:to-orange-400 hover:shadow-red-600/40">🔥 Aproveitar Promoção</a><div class="mt-5 pt-5 border-t border-slate-700/60 text-center"><p class="text-xs text-slate-400 mb-1.5">Precisa de mais números? Adicione canais conforme cresce:</p><p class="text-sm text-slate-300">R$ <span class="text-transparent bg-clip-text bg-gradient-to-r from-red-400 to-orange-400 font-bold">97,00</span>/mês por canal adicional</p><p class="text-xs text-slate-500 mt-1 leading-relaxed">Inclui IP dedicado e rodízio para máxima segurança contra banimentos · Disponível a partir do plano Lunar</p></div></div></div></div><div class="mt-24 scroll-reveal revealed"><section class="relative z-10 grid grid-cols-1 md:grid-cols-12 border border-slate-700/60 rounded-2xl overflow-hidden bg-slate-900/40"><div class="col-span-1 md:col-span-4 p-8 md:p-12 border-b md:border-b-0 md:border-r border-slate-700/60 flex flex-col justify-center min-h-[200px] md:min-h-[340px] bg-slate-800/50"><h3 class="text-3xl md:text-4xl font-semibold tracking-tight text-white leading-tight">Em qualquer plano<br class="hidden md:block"> você já tem</h3></div><div class="col-span-1 md:col-span-8 grid grid-cols-1 sm:grid-cols-2"><div class="group p-6 md:p-8 border-b border-slate-700/60 sm:odd:border-r last:border-b-0 sm:[&:nth-child(5)]:border-b-0 flex items-start justify-between gap-4 hover:bg-slate-800/40 transition-colors duration-300"><div><span class="text-xs font-mono text-slate-500 mb-2 block">01</span><h4 class="text-base md:text-lg font-medium text-slate-200 leading-snug group-hover:text-white transition-colors duration-300">Encurtador de link personalizado por grupo</h4></div><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-7 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg></div><div class="group p-6 md:p-8 border-b border-slate-700/60 sm:odd:border-r last:border-b-0 sm:[&:nth-child(5)]:border-b-0 flex items-start justify-between gap-4 hover:bg-slate-800/40 transition-colors duration-300"><div><span class="text-xs font-mono text-slate-500 mb-2 block">02</span><h4 class="text-base md:text-lg font-medium text-slate-200 leading-snug group-hover:text-white transition-colors duration-300">Estrutura dedicada para cada número conectado</h4></div><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-7 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg></div><div class="group p-6 md:p-8 border-b border-slate-700/60 sm:odd:border-r last:border-b-0 sm:[&:nth-child(5)]:border-b-0 flex items-start justify-between gap-4 hover:bg-slate-800/40 transition-colors duration-300"><div><span class="text-xs font-mono text-slate-500 mb-2 block">03</span><h4 class="text-base md:text-lg font-medium text-slate-200 leading-snug group-hover:text-white transition-colors duration-300">Proteção de números por Proxy</h4></div><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-7 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg></div><div class="group p-6 md:p-8 border-b border-slate-700/60 sm:odd:border-r last:border-b-0 sm:[&:nth-child(5)]:border-b-0 flex items-start justify-between gap-4 hover:bg-slate-800/40 transition-colors duration-300"><div><span class="text-xs font-mono text-slate-500 mb-2 block">04</span><h4 class="text-base md:text-lg font-medium text-slate-200 leading-snug group-hover:text-white transition-colors duration-300">Monitoramento de grupos com Link Preview</h4></div><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-7 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg></div><div class="group p-6 md:p-8 border-b border-slate-700/60 sm:odd:border-r last:border-b-0 sm:[&:nth-child(5)]:border-b-0 flex items-start justify-between gap-4 hover:bg-slate-800/40 transition-colors duration-300"><div><span class="text-xs font-mono text-slate-500 mb-2 block">05</span><h4 class="text-base md:text-lg font-medium text-slate-200 leading-snug group-hover:text-white transition-colors duration-300">Crédito de IA ilimitado para texto</h4></div><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-7 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg></div><div class="group p-6 md:p-8 border-b border-slate-700/60 sm:odd:border-r last:border-b-0 sm:[&:nth-child(5)]:border-b-0 flex items-start justify-between gap-4 hover:bg-slate-800/40 transition-colors duration-300"><div><span class="text-xs font-mono text-slate-500 mb-2 block">06</span><h4 class="text-base md:text-lg font-medium text-slate-200 leading-snug group-hover:text-white transition-colors duration-300">Sistema de Trava e Anti-Ban</h4></div><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-check w-5 h-5 text-emerald-400 shrink-0 mt-7 transition-transform duration-300 group-hover:scale-110" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg></div></div></section></div></div></section>
+
+<!-- ============ FAQ ============ -->
+<section id="faq" class="max-w-3xl mx-auto px-6 py-12 sm:py-20 relative z-10">
+  <div class="text-center mb-12">
+    <h2 class="text-3xl md:text-5xl text-white font-bricolage font-light tracking-tight mb-4"><span class="text-indigo-400">Perguntas</span> Frequentes</h2>
+    <p class="text-neutral-400 text-sm leading-relaxed max-w-md mx-auto">Tire suas dúvidas sobre automação WhatsApp e como o OrbitSender pode ajudar você a escalar seus grupos.</p>
+  </div>
+  <div class="space-y-3" id="faq-list"></div>
+</section>
+
+<!-- ============ CTA ============ -->
+<section class="max-w-4xl mx-auto px-6 py-12 sm:py-20 relative z-10">
+  <div class="bg-[#0d1322] border border-white/10 rounded-3xl p-8 sm:p-10 md:p-16 text-center relative overflow-hidden">
+    <div class="absolute -top-40 left-1/2 -translate-x-1/2 w-[600px] h-[400px] bg-indigo-600/10 rounded-full blur-[120px] pointer-events-none"></div>
+    <div class="inline-flex items-center gap-2 rounded-full bg-indigo-500/10 border border-indigo-500/30 px-4 py-1.5 text-xs text-indigo-300 font-semibold mb-8 relative z-10"><span class="h-1.5 w-1.5 rounded-full bg-indigo-400"></span>Cada dia manual é dinheiro que você deixa na mesa</div>
+    <h2 class="text-2xl sm:text-3xl md:text-5xl text-white font-bricolage font-light tracking-tight mb-5 leading-[1.1] relative z-10">Seus concorrentes já estão <span class="text-indigo-400">postando mais, mais rápido,</span> mais vezes.</h2>
+    <p class="text-base text-neutral-400 mb-2 max-w-xl mx-auto relative z-10">E você?</p>
+    <p class="text-base text-neutral-300 mb-10 max-w-xl mx-auto font-medium relative z-10">Ainda decidindo se automatiza.</p>
+    <div class="flex flex-col sm:flex-row justify-center items-center gap-3 relative z-10">
+      <a href="#precos" class="w-full sm:w-auto inline-flex justify-center items-center gap-2 rounded-full bg-gradient-to-t from-indigo-500 via-violet-500 to-purple-600 text-white px-8 py-4 text-sm font-medium ring-1 ring-inset ring-white/40 shadow-[0_0_40px_-5px_rgba(99, 102, 241,0.6)] hover:scale-105 transition-all duration-300">Quero vender mais todos os dias <i data-lucide="arrow-right" class="w-4 h-4"></i></a>
+      <a href="https://wa.me/554497357216?text=Olá! Quero saber mais sobre o OrbitSender." target="_blank" rel="noopener noreferrer" class="w-full sm:w-auto inline-flex justify-center items-center rounded-full bg-white text-black px-8 py-4 text-sm font-medium hover:bg-neutral-200 transition-colors">Falar com especialista</a>
+    </div>
+    <div class="mt-10 flex flex-wrap justify-center gap-4 text-xs text-neutral-500 relative z-10">
+      <span class="flex items-center gap-1.5"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>Afiliados já rodando operação 24h</span>
+      <span class="hidden sm:inline text-neutral-700">·</span>
+      <span class="flex items-center gap-1.5"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>Sem depender de esforço manual</span>
+      <span class="hidden sm:inline text-neutral-700">·</span>
+      <span class="flex items-center gap-1.5"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>Cancele quando quiser</span>
+    </div>
+  </div>
+</section>
+
+<!-- ============ SUPPORT ============ -->
+<section id="suporte" class="max-w-7xl mx-auto px-6 py-12 sm:py-20 relative z-10">
+  <div class="text-center mb-12">
+    <div class="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs font-semibold mb-6"><span class="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse"></span>ESTAMOS PRONTOS PARA AJUDAR</div>
+    <h2 class="text-3xl sm:text-4xl md:text-5xl text-white font-bricolage font-light tracking-tight mb-6">Precisa de <span class="text-indigo-400">Suporte</span>?</h2>
+    <p class="text-neutral-400 max-w-2xl mx-auto text-sm sm:text-base leading-relaxed">Fale com nosso time via WhatsApp. Resposta rápida, suporte especializado e disponível 24/7.</p>
+  </div>
+  <div class="max-w-2xl mx-auto">
+    <a href="https://wa.me/554497357216" target="_blank" rel="noopener noreferrer" class="group relative rounded-3xl border border-emerald-500/40 hover:border-emerald-400/70 bg-[#0d1322] p-8 sm:p-12 shadow-2xl hover:shadow-emerald-500/20 hover:scale-[1.02] transition-all duration-500 overflow-hidden flex flex-col items-center text-center">
+      <div class="absolute -top-24 -right-24 w-48 h-48 rounded-full bg-emerald-500/10 blur-3xl opacity-0 group-hover:opacity-30 transition-opacity duration-500 pointer-events-none"></div>
+      <div class="inline-flex items-center gap-2 w-fit mb-8 px-3 py-1.5 rounded-full bg-emerald-500/10 border border-emerald-500/30 relative z-10"><span class="h-2 w-2 rounded-full bg-emerald-400 animate-pulse"></span><span class="text-xs font-semibold text-emerald-300">Resposta em 2 minutos</span></div>
+      <div class="w-20 h-20 sm:w-24 sm:h-24 rounded-2xl bg-gradient-to-br from-emerald-600 to-emerald-500 flex items-center justify-center transform group-hover:scale-110 transition-transform duration-300 mb-8 relative z-10">
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" width="48" height="48" fill="white" aria-hidden="true"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 0 1-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 0 1-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 0 1 2.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0 0 12.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 0 0 5.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 0 0-3.48-8.413z"></path></svg>
+      </div>
+      <h3 class="text-2xl sm:text-3xl font-bricolage font-light tracking-tight text-white mb-3 relative z-10">Fale com nosso suporte</h3>
+      <p class="text-neutral-400 text-sm sm:text-base leading-relaxed mb-8 relative z-10 max-w-sm">Chat direto via WhatsApp com resposta rápida do nosso time especializado. Disponível 24/7 para resolver suas dúvidas.</p>
+      <div class="inline-flex items-center justify-center gap-2 px-8 py-4 rounded-full font-medium text-white bg-gradient-to-r from-emerald-600 to-emerald-500 group-hover:-translate-y-1 transition-all duration-300 relative z-10">Iniciar Chat no WhatsApp <i data-lucide="arrow-right" class="w-4 h-4 group-hover:translate-x-1 transition-transform"></i></div>
+    </a>
+  </div>
+</section>
+
+<!-- ============ FOOTER ============ -->
+<footer class="bg-gradient-to-tr from-white/0 via-white/[0.04] to-white/0 max-w-7xl rounded-3xl mt-8 sm:mt-12 mb-8 sm:mb-12 mx-2.5 lg:mx-auto pt-16 px-6 pb-8 relative z-10" style="--border-gradient: linear-gradient(45deg, rgba(255,255,255,0), rgba(255,255,255,0.1), rgba(255,255,255,0)); --border-radius-before: 24px">
+  <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-12 mb-12 px-2">
+    <div>
+      <div class="flex items-center gap-2 mb-6">
+        <div class="border-gradient bg-white/10 w-8 h-8 rounded-full flex items-center justify-center"><i data-lucide="rocket" class="w-3.5 h-3.5 text-white"></i></div>
+        <span class="text-base font-semibold text-white tracking-tight">Orbit<span class="text-indigo-400">Sender</span></span>
+      </div>
+      <p class="text-neutral-400 text-sm leading-relaxed mb-4">A única plataforma de envio em massa que combina API própria, múltiplos números por conta e inteligência artificial.</p>
+      <div class="flex flex-wrap gap-2 mt-4">
+        <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border border-white/10 bg-white/5 text-emerald-400 text-xs font-medium"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>LGPD Compliant</span>
+        <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border border-white/10 bg-white/5 text-indigo-400 text-xs font-medium"><span class="w-1.5 h-1.5 rounded-full bg-indigo-400"></span>99.9% Uptime</span>
+      </div>
+    </div>
+    <div>
+      <h3 class="text-white font-semibold mb-6">Produto</h3>
+      <ul class="space-y-3 text-sm text-neutral-400">
+        <li><a href="#funcionalidades" class="hover:text-indigo-400 transition-colors">Funcionalidades</a></li>
+        <li><a href="#diferenciais" class="hover:text-indigo-400 transition-colors">Diferenciais</a></li>
+        <li><a href="#precos" class="hover:text-indigo-400 transition-colors">Preços</a></li>
+        <li><a href="/#roadmap" class="hover:text-indigo-400 transition-colors">Roadmap</a></li>
+      </ul>
+    </div>
+    <div>
+      <h3 class="text-white font-semibold mb-6">Empresa</h3>
+      <ul class="space-y-3 text-sm text-neutral-400">
+        <li><a href="/#sobre" class="hover:text-indigo-400 transition-colors">Sobre Nós</a></li>
+        <li><a href="/#contato" class="hover:text-indigo-400 transition-colors">Contato</a></li>
+      </ul>
+    </div>
+    <div>
+      <h3 class="text-white font-semibold mb-6">Suporte</h3>
+      <ul class="space-y-3 text-sm text-neutral-400">
+        <li><a href="/docs" class="hover:text-indigo-400 transition-colors">Documentação</a></li>
+        <li><a href="https://app.orbitsender.com/help" class="hover:text-indigo-400 transition-colors">Central de Ajuda</a></li>
+        <li><a href="https://app.orbitsender.com/status" class="hover:text-indigo-400 transition-colors">Status do Sistema</a></li>
+        <li><a href="/#termos" class="hover:text-indigo-400 transition-colors">Termos de Uso</a></li>
+      </ul>
+    </div>
+  </div>
+  <div class="px-2">
+    <div class="w-full h-px bg-gradient-to-r from-transparent via-white/10 to-transparent mb-8"></div>
+    <div class="flex flex-col md:flex-row justify-between items-center gap-4 text-xs text-neutral-400">
+      <p>© 2025 OrbitSender. Todos os direitos reservados.</p>
+      <div class="flex gap-6">
+        <a href="/#privacidade" class="hover:text-white transition-colors">Privacidade</a>
+        <a href="/#termos" class="hover:text-white transition-colors">Termos</a>
+        <a href="/#lgpd" class="hover:text-white transition-colors">LGPD</a>
+      </div>
+    </div>
+  </div>
+</footer>
+
+<!-- WhatsApp Floating Button -->
+<a href="https://wa.me/554497357216" target="_blank" rel="noopener noreferrer" class="fixed bottom-6 right-6 z-50 flex items-center justify-center w-14 h-14 bg-[#25D366] rounded-full shadow-lg hover:shadow-xl hover:scale-110 transition-all duration-300 group" aria-label="Falar com suporte no WhatsApp" title="Suporte WhatsApp">
+  <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg" width="28" height="28" fill="white" class="group-hover:scale-110 transition-transform duration-300"><path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 0 1-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 0 1-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 0 1 2.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0 0 12.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 0 0 5.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 0 0-3.48-8.413z"></path></svg>
+</a>
+
+<!-- ============ SCRIPTS ============ -->
+<script>
+  /* ---------- Data ---------- */
+  const PLANS = {
+    cometa: {
+      title: 'COMETA', price: 'R$ 129,90', old: 'R$ 142,89', discount: '-10% OFF', save: 'Economize R$ 12,99/mês',
+      desc: 'Ideal para validar sua operação e começar os primeiros envios.',
+      url: 'https://pay.kiwify.com.br/u6Xy97a',
+      features: [
+        { t: 'Envios e Ofertas Ilimitadas', i: true },
+        { t: 'Gerencie até 10 Grupos', i: true },
+        { t: 'Fazolli Arena: Replique as ofertas do Fazolli nos seus grupos automaticamente', i: true },
+        { t: 'Fila Agendada: Programe suas ofertas para o dia todo', i: true },
+        { t: 'Replique Grupos: Copie publicações de outros grupos de terceiros', i: true },
+        { t: 'Entrega Robusta: Garantimos a entrega para todos os membros do grupo', i: true },
+        { t: 'Proteção Anti-Ban: Tecnologia de segurança integrada', i: true },
+        { t: 'Apenas 1 Conexão WhatsApp', i: true },
+        { t: 'IA para Gerar Promoções', i: true },
+        { t: 'Link Preview e Carrossel de Ofertas', i: true },
+        { t: 'Integração: Shopee, Amazon, ML e Magalu', i: true },
+        { t: 'Acesso para Equipe / Gestão de Membros', i: false },
+        { t: 'MultSender PRO (Cadastro em massa)', i: false },
+        { t: 'Infraestrutura Premium Isolada', i: false },
+      ],
+    },
+    lunar: {
+      title: 'LUNAR', price: 'R$ 229,90', old: 'R$ 264,39', discount: '-15% OFF', save: 'Economize R$ 34,49/mês',
+      desc: 'Focado em crescimento e expansão da operação.',
+      url: 'https://pay.kiwify.com.br/fG4UEO7',
+      features: [
+        { t: 'TUDO DO PLANO COMETA E...', i: true, arrow: true },
+        { t: 'Gerencie até 30 Grupos', i: true },
+        { t: 'Escala de Conexões: Contrate novos números conforme sua necessidade', i: true },
+        { t: 'QuickSender: Sistema de envio ultra rápido', i: true },
+        { t: 'IA Optimizer: +40% de Cliques', i: true },
+        { t: 'Rodízio de IPs Dedicados: Maior segurança nos disparos', i: true },
+        { t: 'Dashboard de Métricas', i: true },
+        { t: 'Acesso para Equipe / Gestão de Membros', i: false },
+        { t: 'MultSender PRO (Cadastro em massa)', i: false },
+        { t: 'Infraestrutura Premium Isolada', i: false },
+      ],
+    },
+    nova: {
+      title: 'NOVA', price: 'R$ 399,00', old: 'R$ 497,00', discount: '-20% OFF', save: 'Economize R$ 98/mês',
+      desc: 'A potência máxima: Gestão de equipe e automação industrial.',
+      url: 'https://pay.kiwify.com.br/RZ72mdo',
+      features: [
+        { t: 'TUDO DO PLANO LUNAR E...', i: true, arrow: true },
+        { t: 'Grupos ILIMITADOS', i: true },
+        { t: 'Gestão de Equipe: Acesso multi-membros para gerenciar sua operação', i: true },
+        { t: 'Escala de Conexões Ilimitada: Contrate quantos números sua operação exigir', i: true },
+        { t: 'Infraestrutura Premium Isolada: Máxima performance e estabilidade', i: true },
+        { t: 'MultSender PRO: Cole 50 links e transforme em 50 campanhas instantaneamente', i: true },
+        { t: 'Disparo Simultâneo: Várias filas rodando ao mesmo tempo', i: true },
+        { t: 'API e Webhook para Integrações Externas', i: true },
+        { t: 'Métricas Avançadas: Relatórios de performance de alto nível', i: true },
+        { t: 'Suporte via WhatsApp Prioritário', i: true },
+      ],
+    },
+  };
+
+  const activeBtn = 'relative w-full flex items-center justify-between p-5 rounded-xl bg-gradient-to-r from-indigo-500 to-violet-500 text-white shadow-[0_0_40px_-10px_rgba(99, 102, 241,0.4)] transition-transform hover:scale-[1.02] group border-t border-white/20';
+  const inactiveBtn = 'w-full flex items-center justify-between p-5 rounded-xl bg-[#13182b] border border-white/5 text-neutral-200 hover:bg-[#1b2138] hover:border-white/10 transition-all group text-left';
+
+  const checkSvg = '<svg width="14" height="14" viewBox="0 0 24 24" fill="#6366f1" class="shrink-0 mt-0.5"><path d="M22 12 6 22V2z" stroke="none"></path></svg>';
+  const xSvg = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#525252" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="shrink-0 mt-0.5"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg>';
+  const arrowSvg = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#6366f1" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="shrink-0 mt-0.5"><path d="M5 12h14"></path><path d="m12 5 7 7-7 7"></path></svg>';
+
+  function renderFeatures(plan) {
+    return plan.features.map(f => {
+      if (f.arrow) {
+        return '<div class="flex items-start gap-3">' + arrowSvg + '<span class="font-bold text-transparent bg-clip-text bg-gradient-to-r from-indigo-400 to-violet-400 text-xs uppercase tracking-wide">' + f.t + '</span></div>';
+      }
+      const icon = f.i ? checkSvg : xSvg;
+      const cls = f.i ? 'text-white text-sm' : 'text-neutral-600 text-sm line-through';
+      return '<div class="flex items-start gap-3 ' + (f.i ? '' : 'opacity-50') + '">' + icon + '<span class="' + cls + '">' + f.t + '</span></div>';
+    }).join('');
+  }
+
+  window.selectPlan = function (key) {
+    ['cometa', 'lunar', 'nova'].forEach(k => {
+      const btn = document.getElementById('btn-' + k);
+      btn.className = (k === key) ? activeBtn : inactiveBtn;
+      const path = document.getElementById('path-' + k);
+      if (k === key) { path.setAttribute('stroke', '#6366f1'); path.setAttribute('class', 'animate-flow'); path.setAttribute('stroke-dasharray', '8 8'); }
+      else { path.setAttribute('stroke', '#525252'); path.setAttribute('class', 'opacity-20'); path.setAttribute('stroke-dasharray', '6 6'); }
+    });
+    const p = PLANS[key];
+    document.getElementById('plan-title').textContent = p.title;
+    document.getElementById('plan-price').textContent = p.price;
+    document.getElementById('plan-old').textContent = p.old;
+    document.getElementById('plan-discount').textContent = p.discount;
+    document.getElementById('plan-save').innerHTML = '<i data-lucide="flame" class="w-3 h-3"></i>' + p.save;
+    document.getElementById('plan-desc').textContent = p.desc;
+    document.getElementById('plan-features').innerHTML = renderFeatures(p);
+    document.getElementById('plan-cta').setAttribute('href', p.url);
+    if (window.lucide) lucide.createIcons();
+  };
+
+  /* ---------- Testimonials ---------- */
+  const REVIEWS = [
+    { name: 'João Silva', role: 'Afiliado · 50+ grupos', content: 'Trabalho com 50+ grupos. Antes perdia ofertas por instabilidade. Agora com entrega garantida e múltiplos números, minhas vendas triplicaram.', metric: '+300% de vendas', image: 'https://picsum.photos/100/100?random=1' },
+    { name: 'Maria Santos', role: 'Afiliada · Achadinhos', content: 'O fallback automático é incrível! Quando um número cai, outro assume na hora. Nunca mais perdi uma oferta quente por problema técnico.', metric: '0% de ofertas perdidas', image: 'https://picsum.photos/100/100?random=2' },
+    { name: 'Carlos Oliveira', role: 'Afiliado · Amazon · Shopee', content: 'A IA otimiza minhas ofertas e aumentou meus cliques em 40%! Uma oferta simples vira uma mensagem que converte muito mais. E o suporte resolve tudo rapidinho!', metric: '+40% de cliques', image: 'https://picsum.photos/100/100?random=3' },
+  ];
+  function showReview(idx) {
+    const r = REVIEWS[idx];
+    document.getElementById('t-quote').textContent = '"' + r.content + '"';
+    document.getElementById('t-metric').textContent = r.metric;
+    document.getElementById('t-name').textContent = r.name;
+    document.getElementById('t-role').textContent = r.role;
+    document.getElementById('t-img').src = r.image;
+    document.querySelectorAll('[data-thumb]').forEach((el, i) => {
+      el.className = 'w-9 h-9 rounded-full border-2 overflow-hidden transition-all duration-200 shrink-0 ' + (i === idx ? 'border-indigo-400 ring-2 ring-indigo-400/30 scale-110' : 'border-white/20 opacity-50 hover:opacity-80');
+    });
+  }
+  function buildThumbs() {
+    const wrap = document.getElementById('t-thumbs');
+    wrap.innerHTML = REVIEWS.map((r, i) => '<button data-thumb onclick="showReview(' + i + ')" aria-label="Ver depoimento de ' + r.name + '" class="w-9 h-9 rounded-full border-2 overflow-hidden transition-all duration-200 shrink-0 border-white/20 opacity-50"><img src="' + r.image + '" alt="' + r.name + '" class="w-full h-full object-cover" loading="lazy"/></button>').join('');
+  }
+
+  /* ---------- FAQ ---------- */
+  const FAQS = [
+    { q: 'O OrbitSender é ideal para afiliados que trabalham com grupos?', a: 'Sim! Foi feito especialmente para afiliados que trabalham com grupos. Com múltiplos números, distribuição automática, entrega garantida de mensagens, uptime de 99,9% e IA que pode aumentar cliques em até 40%, você escala sua operação sem perder vendas.' },
+    { q: 'O que acontece se um número cair durante o envio de ofertas?', a: 'O fallback automático detecta e redireciona imediatamente para outro número. Suas ofertas continuam sendo enviadas sem interrupção. Zero perda de vendas.' },
+    { q: 'Preciso ter vários celulares físicos para gerenciar muitos grupos?', a: 'Não! Você pode usar nosso Celular Virtual, onde hospedamos o WhatsApp na nuvem. Ou conecte seus próprios números. Tudo em uma única conta.' },
+    { q: 'Como organizo meus grupos?', a: 'Você sincroniza seus grupos e organiza por segmentos (ex: \'Achadinhos Shopee\', \'Ofertas Amazon\'). Depois é só criar a oferta e enviar para os segmentos escolhidos.' },
+    { q: 'A IA realmente aumenta cliques nas ofertas?', a: 'Sim! A IA reescreve suas ofertas em 9 estilos diferentes (Persuasivo, Urgente, Humor, etc) e pode aumentar cliques nos links de afiliados em até 40%. Uma oferta simples vira uma mensagem que converte muito mais.' },
+    { q: 'Posso usar no celular para enviar ofertas rapidamente?', a: 'Sim! A interface funciona perfeitamente no celular, tablet e computador. Envie ofertas de qualquer lugar, a qualquer hora.' },
+  ];
+  function buildFaq() {
+    const list = document.getElementById('faq-list');
+    list.innerHTML = FAQS.map((f, i) => (
+      '<div class="bg-[#0d1322] border border-white/10 rounded-2xl overflow-hidden">' +
+        '<button onclick="toggleFaq(' + i + ')" class="w-full flex justify-between items-center p-5 text-left hover:bg-white/[0.03] transition-colors" aria-expanded="false">' +
+          '<span class="font-semibold text-white text-sm pr-4 leading-snug">' + f.q + '</span>' +
+          '<i data-lucide="chevron-down" id="faq-chev-' + i + '" class="text-neutral-500 shrink-0 transition-transform duration-300 w-4 h-4"></i>' +
+        '</button>' +
+        '<div id="faq-body-' + i + '" class="grid transition-all duration-300 ease-in-out" style="grid-template-rows:0fr">' +
+          '<div class="overflow-hidden"><div class="px-5 pb-5 text-neutral-400 text-sm leading-relaxed border-t border-white/5 pt-4">' + f.a + '</div></div>' +
+        '</div>' +
+      '</div>'
+    )).join('');
+  }
+  let openFaq = -1;
+  window.toggleFaq = function (i) {
+    if (openFaq === i) { closeFaq(i); openFaq = -1; return; }
+    if (openFaq !== -1) closeFaq(openFaq);
+    const body = document.getElementById('faq-body-' + i);
+    const chev = document.getElementById('faq-chev-' + i);
+    body.style.gridTemplateRows = '1fr';
+    chev.classList.add('rotate-180', 'text-indigo-400');
+    openFaq = i;
+  };
+  function closeFaq(i) {
+    const body = document.getElementById('faq-body-' + i);
+    const chev = document.getElementById('faq-chev-' + i);
+    body.style.gridTemplateRows = '0fr';
+    chev.classList.remove('rotate-180', 'text-indigo-400');
+  }
+
+  /* ---------- Decorative builders ---------- */
+  function buildQr() {
+    const on = [0, 1, 5, 6, 10, 14, 15, 16, 20, 24, 23, 18, 4, 9];
+    const grid = document.getElementById('qr-grid');
+    let html = '';
+    for (let i = 0; i < 25; i++) html += '<div class="rounded-[1px] ' + (on.includes(i) ? 'bg-white/80' : 'bg-transparent') + '"></div>';
+    grid.innerHTML = html;
+  }
+  function buildBars() {
+    const heights = [65, 72, 80, 75, 88, 85, 92, 90, 95];
+    document.getElementById('bars-chart').innerHTML = heights.map(h => '<div class="flex-1 bg-gradient-to-t from-indigo-500/40 to-indigo-400/20 rounded-sm" style="height:' + (h * 0.45) + '%"></div>').join('');
+  }
+
+  /* ---------- Mobile menu ---------- */
+  const menuBtn = document.getElementById('menu-btn');
+  const mobileMenu = document.getElementById('mobile-menu');
+  menuBtn.addEventListener('click', () => mobileMenu.classList.toggle('hidden'));
+  mobileMenu.querySelectorAll('a').forEach(a => a.addEventListener('click', () => mobileMenu.classList.add('hidden')));
+
+  /* ---------- Scroll-in observer ---------- */
+  const io = new IntersectionObserver((entries) => {
+    entries.forEach(e => { if (e.isIntersecting) { e.target.classList.add('animate'); io.unobserve(e.target); } });
+  }, { threshold: 0.1, rootMargin: '0px 0px -10% 0px' });
+
+  /* ---------- Init ---------- */
+  document.addEventListener('DOMContentLoaded', () => {
+    buildThumbs();
+    showReview(0);
+    buildFaq();
+    buildQr();
+    buildBars();
+    document.querySelectorAll('.animate-on-scroll').forEach(el => io.observe(el));
+    if (window.lucide) lucide.createIcons();
+  });
+</script>
+
+<!-- ============ Meta Pixel — Eventos de Conversão ============ -->
+<script>
+(function () {
+  function fire(event, params) {
+    if (window.fbq) { params ? fbq('track', event, params) : fbq('track', event); }
+  }
+
+  // Converte "R$ 129,90" -> 129.90 (número que a Meta entende)
+  function parsePrice(text) {
+    if (!text) return undefined;
+    var n = parseFloat(text.replace(/[^\d,]/g, '').replace(/\./g, '').replace(',', '.'));
+    return isNaN(n) ? undefined : n;
+  }
+
+  // ── InitiateCheckout (clique nos botões Kiwify) + Contact (WhatsApp) ──
+  document.addEventListener('click', function (e) {
+    var checkout = e.target.closest('a[href*="pay.kiwify.com.br"]');
+    if (checkout) {
+      // Tenta enriquecer com o plano atualmente selecionado (#plan-title / #plan-price)
+      var titleEl = document.getElementById('plan-title');
+      var priceEl = document.getElementById('plan-price');
+      var params = { currency: 'BRL' };
+      if (titleEl && titleEl.textContent) params.content_name = titleEl.textContent.trim();
+      var value = parsePrice(priceEl && priceEl.textContent);
+      if (value !== undefined) params.value = value;
+      fire('InitiateCheckout', params);
+      return;
+    }
+
+    var wa = e.target.closest('a[href*="wa.me"]');
+    if (wa) { fire('Contact'); }
+  }, true); // fase de captura: pega o clique antes da navegação
+
+  // ── ViewContent: dispara uma vez quando a seção de Preços fica visível ──
+  var pricing = document.getElementById('precos');
+  if (pricing && window.IntersectionObserver) {
+    var vcFired = false;
+    var vcObserver = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (entry.isIntersecting && !vcFired) {
+          vcFired = true;
+          fire('ViewContent', { content_name: 'Planos', content_category: 'pricing' });
+          vcObserver.disconnect();
+        }
+      });
+    }, { threshold: 0.3 });
+    vcObserver.observe(pricing);
+  }
+})();
+</script>
+
+</body>
+</html>
