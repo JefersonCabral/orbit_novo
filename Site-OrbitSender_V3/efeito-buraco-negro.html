@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Efeito Buraco Negro — OrbitSender (isolado)</title>
+
+<!-- Tailwind (Play CDN) -->
+<script src="https://cdn.tailwindcss.com"></script>
+
+<style>
+  body {
+    margin: 0;
+    background-color: #0A0E1A;
+    color: #fff;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* ===== Hero WebGL: carregamento fluido ===== */
+  /* Efeito "buraco negro" começa invisível e faz fade-in suave quando pronto */
+  #hero-fx {
+    opacity: 0;
+    transition: opacity 1.6s cubic-bezier(0.4, 0, 0.2, 1);
+    will-change: opacity;
+  }
+  #hero-fx.is-ready { opacity: 0.8; }
+
+  /* Capa preta que cobre o efeito enquanto ele carrega e some com fade */
+  #hero-loader {
+    opacity: 1;
+    transition: opacity 1.2s cubic-bezier(0.4, 0, 0.2, 1);
+    will-change: opacity;
+  }
+  #hero-loader.is-hidden {
+    opacity: 0;
+    visibility: hidden;
+    transition: opacity 1.2s cubic-bezier(0.4, 0, 0.2, 1), visibility 0s linear 1.2s;
+  }
+
+  /* Respeita usuários que preferem menos movimento */
+  @media (prefers-reduced-motion: reduce) {
+    #hero-fx, #hero-loader { transition: opacity 0.3s ease; }
+  }
+</style>
+</head>
+
+<body class="bg-[#0A0E1A] text-white relative">
+
+<!-- ============ EFEITO "BURACO NEGRO" (UnicornStudio WebGL — igual ao flux-motion) ============ -->
+<!-- Cor roxa forçada via overlay mix-blend-color (independe da cor original da cena). Ajuste o gradiente do overlay para mudar o tom. -->
+<div id="hero-fx" class="absolute top-0 left-0 w-full h-[680px] sm:h-[840px] z-0 pointer-events-none overflow-hidden">
+  <div class="absolute inset-0 isolate" style="mask-image: linear-gradient(to bottom, transparent 0%, #000 5%, #000 70%, transparent 100%); -webkit-mask-image: linear-gradient(to bottom, transparent 0%, #000 5%, #000 70%, transparent 100%)">
+    <!-- Cena WebGL. data-us-dpi/fps/scale reduzem drasticamente o uso de GPU; lazyload só inicia quando visível -->
+    <div class="absolute inset-0 [filter:brightness(1.1)]" data-us-project="HzcaAbRLaALMhHJp8gLY" data-us-dpi="1" data-us-fps="30" data-us-scale="0.7" data-us-lazyload="true"></div>
+    <!-- Overlay: força a cor para roxo/violeta (mix-blend-color) independente da cor original da cena -->
+    <div class="absolute inset-0 mix-blend-color bg-gradient-to-br from-indigo-600 via-violet-600 to-fuchsia-600"></div>
+  </div>
+</div>
+
+<!-- Capa preta: cobre o efeito enquanto o WebGL carrega e desvanece com fade -->
+<div id="hero-loader" class="absolute top-0 left-0 w-full h-[680px] sm:h-[840px] z-[5] pointer-events-none bg-[#0A0E1A]"
+     style="mask-image: linear-gradient(to bottom, #000 0%, #000 70%, transparent 100%); -webkit-mask-image: linear-gradient(to bottom, #000 0%, #000 70%, transparent 100%)"></div>
+
+<script type="text/javascript">
+  (function () {
+    var revealed = false;
+
+    // Revela o efeito (fade-in) e esconde a capa preta (fade-out)
+    function reveal() {
+      if (revealed) return;
+      revealed = true;
+      var fx = document.getElementById('hero-fx');
+      var loader = document.getElementById('hero-loader');
+      if (fx) fx.classList.add('is-ready');
+      if (loader) loader.classList.add('is-hidden');
+    }
+
+    function startScene() {
+      try {
+        var p = UnicornStudio.init();
+        // init() devolve uma Promise nas versões 1.4.x — espera resolver + um respiro
+        // para o primeiro frame renderizar antes de revelar.
+        if (p && typeof p.then === 'function') {
+          p.then(function () { setTimeout(reveal, 450); }).catch(reveal);
+        } else {
+          setTimeout(reveal, 900);
+        }
+      } catch (e) { reveal(); }
+      window.UnicornStudio.isInitialized = true;
+    }
+
+    function boot() {
+      if (!window.UnicornStudio) {
+        window.UnicornStudio = { isInitialized: false };
+        var s = document.createElement('script');
+        s.src = "https://cdn.jsdelivr.net/gh/hiunicornstudio/unicornstudio.js@v1.4.29/dist/unicornStudio.umd.js";
+        s.onload = function () { if (!window.UnicornStudio.isInitialized) startScene(); };
+        s.onerror = reveal; // se a CDN falhar, ainda some a capa (não trava a hero)
+        (document.head || document.body).appendChild(s);
+      } else if (!window.UnicornStudio.isInitialized) {
+        startScene();
+      } else {
+        reveal();
+      }
+
+      // Garantia: a capa nunca fica presa por mais de 3,5s aconteça o que acontecer
+      setTimeout(reveal, 3500);
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', boot);
+    } else {
+      boot();
+    }
+  })();
+</script>
+
+</body>
+</html>
